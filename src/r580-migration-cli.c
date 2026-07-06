@@ -18,16 +18,24 @@
  */
 
 #include <stdio.h>
-#include <assert.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cuda.h>
 
-#define CHECK(x) assert(x)
+#define CHECK(x) check((x) != 0, #x, __FILE__, __LINE__)
 #define CHECK_EQ(x, y) CHECK((x) == (y))
 #define CHECK_OK(x) CHECK_EQ(x, 0)
 #define CHECK_NONNEG(x) CHECK((x) >= 0)
+
+void check(bool is_ok, const char *msg, const char *file, int line)
+{
+    if (!is_ok) {
+        fprintf(stderr, "Error: \"%s\" failed at %s:%d\n", msg, file, line);
+        abort();
+    }
+}
 
 #define CUDA_CHECKPOINT(...) spawn((const char *[]){"cuda-checkpoint", __VA_ARGS__, NULL})
 #define UUID_ASCII_SIZE 40
@@ -116,7 +124,7 @@ int main(int argc, char **argv)
         pair->equals = '=';
     }
 
-    char self[10];
+    char self[16];
     sprintf(self, "%d", getpid());
 
     for (int i = 0; i < dev_count; i++) {

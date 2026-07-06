@@ -19,15 +19,23 @@
  */
 
 #include <stdio.h>
-#include <assert.h>
+#include <stdbool.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <cuda.h>
 #include <nvml.h>
 
-#define CHECK(x) assert(x)
+#define CHECK(x) check((x) != 0, #x, __FILE__, __LINE__)
 #define CHECK_EQ(x, y) CHECK((x) == (y))
 #define CHECK_OK(x) CHECK_EQ(x, 0)
+
+void check(bool is_ok, const char *msg, const char *file, int line)
+{
+    if (!is_ok) {
+        fprintf(stderr, "Error: \"%s\" failed at %s:%d\n", msg, file, line);
+        abort();
+    }
+}
 
 void check_persistence_mode(void)
 {

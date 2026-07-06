@@ -5,6 +5,24 @@ which is available in the [bin](bin) directory of this repo.
 This utility can be used to transparently checkpoint and restore CUDA state within a running Linux process,
 and can be combined with [CRIU](https://criu.org/Main_Page) (described below) to fully checkpoint CUDA applications.
 
+## 610 Features
+Display driver version 610 includes this feature not present in 595:
+* cuIpcGetMemHandle-based CUDA IPC support
+
+A [demo program](src/r610-get-mem-handle-ipc.c) shows the two ways that this IPC support can be enabled:
+1. by launching the application with `cuda-checkpoint --launch-job` directly or
+2. by copying the file created by `cuda-checkpoint` and pointing `CUDA_CHECKPOINT_JOB_FILE` to that copy.
+
+Job files should never be reused and (when using the second method above) should only be used in the environment where they were created.
+Also note that, while the `--launch-job` option is present with earlier versions we recommend its use only with driver version 610 and higher.
+For now, cuda-checkpoint must be invoked on the processes in a job sequentially.
+
+## 595 Features
+Display driver version 595 includes this feature not present in 580:
+* Support for ARM CPUs
+
+An ARM build of cuda-checkpoint can be found in the [bin/aarch64\_Linux](bin/aarch64_Linux) directory of this repo.
+
 ## 580 Features
 Display driver version 580 includes these features not present in 570:
 * GPU migration
@@ -250,11 +268,10 @@ localhost# echo hello | nc -u localhost 10000 -W 1
 ```
 
 ## Functionality
-As of display driver version 570, checkpoint and restore functionality is still being actively developed.
+Checkpoint and restore functionality is still being actively developed.
 In particular, `cuda-checkpoint`:
 
-* is x64 only,
-* does not support UVM or IPC memory,
+* does not support UVM memory or IPC memory created with `cuMemExportToShareableHandle()`,
 * waits for already-submitted CUDA work to finish before completing a checkpoint,
 * does not attempt to keep the process in a good state if an error (such as the presence of a UVM allocation) is encountered during checkpoint or restore.
 
