@@ -100,7 +100,10 @@ class Target:
                     raise Skip(line)
             except FileNotFoundError:
                 pass
-            if self.proc.poll() is not None:
+            # After a criu restore the process is a fresh, detached one and we
+            # no longer own a handle to it. Only treat an exited handle as death
+            # while we still hold one.
+            if self.proc is not None and self.proc.poll() is not None:
                 return None
             time.sleep(0.05)
         return None
@@ -141,6 +144,23 @@ def _listed_by_nvidia_smi(pid):
     if proc.returncode != 0:
         return None      # cannot tell
     return str(pid) in proc.stdout.split()
+
+
+def _process_gone(pid):
+    """True once the pid is really gone.
+
+    A dumped process that is our own child becomes a zombie until somebody
+    reaps it, and a zombie still has a /proc entry. Checking for the directory
+    alone reports "still alive" for a process CRIU has already killed.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            fields = fh.read().rsplit(") ", 1)[-1].split()
+        return fields[0] == "Z"
+    except FileNotFoundError:
+        return True
+    except (IndexError, OSError):
+        return False
 
 
 def _wait_until_released(pid, timeout=15.0, interval=0.25):
@@ -203,6 +223,7 @@ def level1_driver(cfg, workdir):
 
 def level2_criu(cfg, workdir):
     """Add the dump. This is where the process actually dies and comes back."""
+    from agent import driver as driver_mod
     from agent.criu import CriuBackend
     from agent.driver import CliBackend
 
@@ -221,14 +242,25 @@ def level2_criu(cfg, workdir):
         driver.checkpoint(target.pid)
         criu.dump(target.pid, images)
 
+        # The target is our child, so reap it: without that it sits as a zombie
+        # and every liveness check reports a process CRIU has already killed.
+        try:
+            target.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("criu dump left the process running")
         deadline = time.monotonic() + 30
-        while time.monotonic() < deadline and os.path.isdir(f"/proc/{target.pid}"):
+        while time.monotonic() < deadline and not _process_gone(target.pid):
             time.sleep(0.1)
-        assert not os.path.isdir(f"/proc/{target.pid}"), "criu dump left the process alive"
+        assert _process_gone(target.pid), "criu dump left the process alive"
 
         restored_pid = criu.restore(images)
-        driver.restore(restored_pid)
-        driver.unlock(restored_pid)
+        # criu owns the restored process now; our handle refers to the one it
+        # killed. Drop it before asking the target anything.
+        target.proc = None
+
+        # The CUDA plugin may already have restored CUDA during criu restore;
+        # resume() asks rather than assuming.
+        resumed = driver_mod.resume(driver, restored_pid, log=_LOG)
 
         after = target.checksum()
         assert after["bad"] == 0, f"{after['bad']} elements corrupted across dump/restore"
@@ -237,11 +269,12 @@ def level2_criu(cfg, workdir):
             "target": target.kind,
             "original_pid": target.pid,
             "restored_pid": restored_pid,
+            "resume": resumed,
             "checksum": before["sum"],
             "images": images,
         }
     finally:
-        target.proc = None      # criu owns the restored process now
+        target.proc = None
         try:
             subprocess.run(["pkill", "-f", "smoke_target"], capture_output=True)
         except OSError:
@@ -267,7 +300,9 @@ def level3_agent(cfg, workdir):
         epoch = "ep-smoke"
         agent.lock("smoke-job", epoch, ranks=[0])
         agent.checkpoint("smoke-job", epoch, ranks=[0])
-        result = agent.dump("smoke-job", epoch, cfg.image_dir, ranks=[0])
+        result = agent.dump(
+            "smoke-job", epoch, cfg.image_dir, ranks=[0], leave_running=True
+        )
         agent.restore(
             "smoke-job", epoch, cfg.image_dir, ranks=[0], from_images=False
         )
@@ -289,13 +324,14 @@ def level4_epoch(cfg, workdir, ranks=2):
 
     if os.geteuid() != 0:
         raise Skip("the agent needs root")
+    # The ranks hold CUDA state through torch when it is present and through the
+    # driver API when it is not, so all that is actually required is a device.
     try:
-        import torch
+        import ctypes
 
-        if not torch.cuda.is_available():
-            raise Skip("level 4 ranks need a CUDA device")
-    except ImportError:
-        raise Skip("level 4 ranks need torch")
+        ctypes.CDLL("libcuda.so.1").cuInit(0)
+    except OSError:
+        raise Skip("level 4 ranks need a CUDA driver")
 
     sim = SimCluster(nodes=1, ranks_per_node=ranks, step_seconds=0.01, real=True)
     sim.start()

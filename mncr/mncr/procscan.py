@@ -1,5 +1,12 @@
 """Inspect a process for resources the CUDA checkpoint path cannot handle.
 
+What this can and cannot tell you, measured rather than assumed: an ordinary
+CUDA process holds /dev/nvidia*, /dev/nvidiactl and /dev/nvidia-uvm the whole
+time it is running, so none of those mean anything before a checkpoint. After
+one, the driver has closed every last one, which makes their absence a real
+precondition for the dump. Actual managed-memory *use* is not visible here at
+all - that is what the P0 interposer is for.
+
 Used from two directions and deliberately shared, so the rank's self-check and
 the agent's external check can never disagree:
 
@@ -66,8 +73,14 @@ _FD_RULES = [
     (
         re.compile(r"^/dev/nvidia-uvm"),
         "uvm_fd",
-        Severity.BEFORE_LOCK,
-        "UVM is not supported by the checkpoint path",
+        Severity.BEFORE_DUMP,
+        # Measured on a real node: every CUDA process opens this, whether or not
+        # it ever allocates managed memory - the runtime initialises UVM
+        # support regardless. Treating it as a pre-lock blocker rejected a
+        # process that checkpoints and restores perfectly. It is only
+        # meaningful after the checkpoint, by which point the driver has closed
+        # it along with every other GPU fd.
+        "GPU fd still open after checkpoint",
     ),
     (
         re.compile(r"^/dev/nvidia(ctl|-modeset|\d+)"),
@@ -88,8 +101,10 @@ _MAP_RULES = [
     (
         re.compile(r"/dev/nvidia-uvm"),
         "uvm_mapping",
-        Severity.BEFORE_LOCK,
-        "managed memory mapping; unsupported",
+        Severity.BEFORE_DUMP,
+        # Same measurement: present in an ordinary CUDA process that never
+        # touches managed memory, so it says nothing before the lock.
+        "UVM mapping still present after checkpoint",
     ),
     (
         re.compile(r"/dev/nvidia\d+"),

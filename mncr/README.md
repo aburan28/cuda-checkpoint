@@ -206,17 +206,23 @@ Proven by test here:
   collectives
 - the full rank lifecycle across a simulated cluster
 
-Not proven, because it needs hardware:
+Proven on real hardware — driver 595.91.07, RTX PRO 6000 Blackwell, CRIU 4.2.1:
 
-- the `cuda-checkpoint` CLI backend and the CRIU backend — written, never run
-- the interposer against real CUDA — its logic is tested, its behaviour under a
-  real driver is not
+- all four `make smoke` levels: driver, +CRIU, +agent, +full coordinator epoch,
+  with device memory verified by checksum at each
+- the `cuda-checkpoint` CLI backend and the CRIU backend
+- the interposer under the production `LD_PRELOAD` path
+- `make preflight` against a node that really does fail one of its checks
+
+Still not proven:
+
 - NCCL-specific teardown — the gloo tests prove the shape, not the NVLS and
-  verbs releases that only NCCL performs
-- the expandable-segments question
+  verbs releases only NCCL performs
+- multi-GPU, NVLS multicast, fabric handles, driver 610
+- restore onto a *different* node (this was one machine)
 
-`make preflight` and `make smoke` are what close that list, and they are the
-first thing to run on a node.
+See [docs/findings-595-blackwell.md](docs/findings-595-blackwell.md), which
+includes the three production bugs that only hardware exposed.
 
 ## Measured on hardware
 

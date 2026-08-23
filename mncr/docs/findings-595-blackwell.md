@@ -111,6 +111,74 @@ the *local* write fits in the notice window and the upload can finish afterwards
 - or when the image is written to instance-local NVMe that survives, which it
 does not on a reclaimed spot instance. Size the working set accordingly.
 
+## With CRIU: all four smoke levels pass
+
+CRIU is not packaged usefully for Ubuntu 22.04 (apt has 3.16, no CUDA plugin), so
+4.2.1 was built from source:
+
+```bash
+sudo apt-get install -y --no-install-recommends build-essential git pkg-config \
+  libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+  python3-protobuf libcap-dev libnl-3-dev libnet1-dev libaio-dev libbsd-dev \
+  libnftables-dev libgnutls28-dev libdrm-dev uuid-dev
+git clone --branch v4.2.1 https://github.com/checkpoint-restore/criu
+make -j"$(nproc)" && sudo make install-criu install-lib install-compel
+sudo install -m0755 plugins/cuda/cuda_plugin.so /usr/lib/criu/
+```
+
+`install-man` needs asciidoc and is not worth installing; `install-cuda` is not
+wired at the top level, hence the manual copy. `criu check` then reports
+"Looks good".
+
+| Level | What it exercises | Result |
+|---|---|---|
+| 1 | driver only | pass, 2.1 s |
+| 2 | + CRIU dump and restore | pass, 2.7 s |
+| 3 | + the agent, its gates and the image pipeline | pass, 3.5 s |
+| 4 | + coordinator, two ranks, full two-phase commit | pass, 4.6 s |
+
+Device memory verified by checksum at every level. The epoch itself took 2.36 s
+for two ranks.
+
+## Three things that only real hardware could show
+
+Each of these passed every simulated test and would have failed in production.
+
+### The CRIU plugin performs the CUDA restore itself
+
+With `cuda_plugin.so` installed, `criu restore` brings the process back on the
+GPU with its memory intact. A subsequent `cuda-checkpoint --action restore`
+then fails with `"the operation cannot be performed in the present state"` -
+because there is nothing left to restore.
+
+The agent now asks (`get_state`) rather than assuming, and treats "already done"
+as success. See `agent/driver.py:resume`. Reporting a working restore as a
+failure, past the commit point, would have cost the job.
+
+### criu dump kills what it dumps
+
+`criu dump` terminates the process unless `--leave-running` is passed. The
+coordinator's `mode="continue"` path dumped and then resumed the process in
+place - which on real CRIU means resuming a process that no longer exists.
+Checkpoint-and-continue would have killed every rank it checkpointed.
+
+The fake CRIU backend never killed anything, so no simulated test could catch
+it. `leave_running` is now threaded from the mode down to the criu call.
+
+### Every CUDA process holds /dev/nvidia-uvm
+
+The process scanner treated `/dev/nvidia-uvm` file descriptors and mappings as
+a pre-lock blocker, on the reasoning that UVM is unsupported. Measured: an
+ordinary CUDA program that only ever calls `cudaMalloc` holds two such fds and a
+mapping, because the runtime initialises UVM support regardless of use. The gate
+rejected a process that checkpoints and restores perfectly - it would have
+rejected every workload on every node.
+
+Those signals moved to the dump gate, where they are meaningful: after a
+checkpoint the driver has closed every GPU fd, so their presence then really
+does mean the checkpoint did not do what we think. Detecting actual managed
+memory *use* is what the P0 interposer is for; /proc cannot tell you.
+
 ## Not measured here
 
 Multi-GPU, NVLS multicast, NCCL, CRIU (the node has none, and Ubuntu 22.04 ships

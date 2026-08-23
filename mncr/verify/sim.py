@@ -142,7 +142,10 @@ class SimCluster:
                 self.coord.register_job(self.job_id, self.rank_refs())
                 return True
             time.sleep(0.05)
-        raise TimeoutError(f"only {have}/{want} ranks registered")
+        raise TimeoutError(
+            f"only {have}/{want} ranks registered after {timeout}s; "
+            f"rank stderr: {self.rank_stderr()}"
+        )
 
     def rank_refs(self):
         refs = []
@@ -162,14 +165,16 @@ class SimCluster:
         Fresh per epoch on purpose: after a restore the peers are at different
         addresses, so reusing the old one would test nothing and would collide
         with the store the destroyed group left behind.
-        """
-        import socket
 
-        probe = socket.socket()
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-        probe.close()
-        return f"tcp://127.0.0.1:{port}"
+        File-based rather than TCP. Picking a free port by binding to zero and
+        closing leaves a window in which something else can take it, and under
+        the load of a full test run that window gets hit - the symptom is an
+        occasional rendezvous timeout with nothing wrong in the code under test.
+        A path cannot be stolen.
+        """
+        self._rendezvous_seq = getattr(self, "_rendezvous_seq", 0) + 1
+        path = os.path.join(self.root, f"rendezvous-{self._rendezvous_seq}")
+        return f"file://{path}"
 
     def progress(self, rank):
         path = os.path.join(self.root, f"rank-{rank}.json")

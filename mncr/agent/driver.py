@@ -179,6 +179,55 @@ class FakeBackend(DriverBackend):
         return self._transition("unlock", pid)
 
 
+#: What the driver says when asked to do something already done to the process.
+ALREADY = "cannot be performed in the present state"
+
+
+def resume(backend, pid, device_map=None, log=None):
+    """Bring a process back, whatever state it was left in.
+
+    Measured on driver 595 with CRIU 4.2.1: when the CUDA plugin is installed,
+    `criu restore` performs the CUDA restore itself. The process comes back on
+    the GPU with its device memory intact, and a subsequent
+    cuda-checkpoint --action restore fails because there is nothing left to
+    restore. Without the plugin - or resuming a process that never went through
+    criu at all - the explicit calls are exactly what is needed.
+
+    So ask rather than assume, and treat "already done" as success. Reporting a
+    working restore as a failure, past the commit point, would cost the job.
+
+    Returns "already-running" or "restored".
+    """
+    state = None
+    try:
+        state = backend.get_state(pid)
+    except DriverError as exc:
+        if log:
+            log.debug("state query failed; probing instead", pid=pid, error=str(exc))
+
+    if state == STATE_RUNNING:
+        if log:
+            log.info("already restored by the criu plugin", pid=pid)
+        return "already-running"
+
+    if state in (STATE_CHECKPOINTED, None):
+        try:
+            backend.restore(pid, device_map=device_map)
+        except DriverError as exc:
+            if ALREADY not in str(exc):
+                raise
+            if log:
+                log.info("restore already performed", pid=pid)
+            return "already-running"
+
+    try:
+        backend.unlock(pid)
+    except DriverError as exc:
+        if ALREADY not in str(exc):
+            raise
+    return "restored"
+
+
 def make(cfg):
     if cfg.fake:
         return FakeBackend(call_latency=getattr(cfg, "fake_call_latency", 0.0))
