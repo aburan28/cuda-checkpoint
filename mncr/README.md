@@ -43,6 +43,7 @@ that **every rank must vote before a single checkpoint call is issued**.
 | `verify/` | P8 | cluster simulator, chaos matrix, scale ladder, on-node smoke test |
 | `tests/` | P8 | unit and protocol tests |
 | `mncrctl` | — | operator CLI |
+| `mncr/metrics.py` | — | Prometheus endpoint on the agent and coordinator |
 
 ## Try it without a GPU
 
@@ -52,7 +53,7 @@ the hardware is simulated.
 
 ```bash
 make check     # compile everything, validate manifests, lint shell and C
-make test      # 103 unit and protocol tests
+make test      # 119 unit and protocol tests
 make chaos     # fault injection at every phase
 make scale     # does wall clock track ranks-per-node or job size?
 ```
@@ -128,6 +129,11 @@ epoch — the same simulator, with the fakes swapped out.
 
 ## Operating it
 
+Pods labelled `mncr.io/checkpointable=true` are mutated on admission: the
+control-directory mount, the `MNCR_*` environment and the job-file path are all
+injected, so a rank pod needs the label and nothing else. Anything the author
+set explicitly is left alone.
+
 ```bash
 kubectl apply -f k8s/crds/
 kubectl apply -f k8s/manifests/rbac.yaml
@@ -149,6 +155,16 @@ mncrctl plan-restore ep-abc --nodes 4    # which nodes could host it, and why no
 mncrctl restore train-7 ep-abc --targets node-a=0,1 --targets node-b=2,3
 mncrctl gc train-7 --retain 3
 mncrctl preflight
+```
+
+Metrics are on `:9180` (agent) and `:9181` (coordinator). The series worth
+alerting on is the one that separates the two kinds of failure:
+
+```
+mncr_epochs_total{outcome="aborted"}   the job survived; something to fix
+mncr_epochs_total{outcome="failed"}    the job did not; restore an image
+mncr_stopped_seconds_bucket            how long the job was not running
+mncr_gate_findings_total{kind=...}     what ranks are still holding
 ```
 
 ```yaml

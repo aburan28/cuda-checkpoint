@@ -8,7 +8,7 @@ import argparse
 import json
 import time
 
-from mncr import config, log, rpc
+from mncr import config, log, metrics, rpc
 from mncr.proto import RankRef
 
 from .client import AgentPool
@@ -215,6 +215,7 @@ def main(argv=None):
     ap.add_argument("--addr", default=None)
     ap.add_argument("--agents", default="", help="node=addr,node=addr")
     ap.add_argument("--epoch-dir", default=None)
+    ap.add_argument("--metrics-port", type=int, default=9181)
     args = ap.parse_args(argv)
 
     cfg = config.load()
@@ -229,6 +230,7 @@ def main(argv=None):
         store=EpochStore(args.epoch_dir) if args.epoch_dir else None,
     )
     server = build_server(coord, args.addr or cfg.coord_addr).start()
+    metrics_server = metrics.serve(args.metrics_port) if args.metrics_port else None
     print(json.dumps(coord.recover()))
     try:
         while True:
@@ -237,6 +239,9 @@ def main(argv=None):
         pass
     finally:
         server.stop()
+        if metrics_server:
+            metrics_server.shutdown()
+            metrics_server.server_close()
     return 0
 
 

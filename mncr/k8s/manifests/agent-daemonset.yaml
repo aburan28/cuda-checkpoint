@@ -10,6 +10,9 @@ spec:
   template:
     metadata:
       labels: {app: mncr-agent}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9180"
     spec:
       serviceAccountName: mncr-agent
       # hostPID is what makes the driver calls possible at all: cuda-checkpoint
@@ -69,6 +72,7 @@ spec:
               value: "60000"
           ports:
             - {name: rpc, containerPort: 7181, hostPort: 7181}
+            - {name: metrics, containerPort: 9180, hostPort: 9180}
           volumeMounts:
             # Shared with every rank pod: the control directory the ranks poll.
             - {name: control, mountPath: /run/mncr}

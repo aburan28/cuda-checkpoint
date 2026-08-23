@@ -10,7 +10,7 @@ Everything else here is bookkeeping around that rule.
 
 import time
 
-from mncr import log
+from mncr import log, metrics
 from mncr.errors import AbortableError, TerminalError, UnreleasedAbortError
 from mncr.proto import Epoch, Phase, Vote
 
@@ -27,7 +27,12 @@ class EpochRunner:
     # ------------------------------------------------------------- utilities
     def _save(self, epoch, phase=None, note=None, error=None):
         if phase is not None:
+            previous = epoch.phase
+            entered = epoch["history"][-1]["at"] if epoch["history"] else epoch["created_at"]
             epoch.set_phase(phase, note)
+            metrics.PHASE_SECONDS.observe(
+                max(0.0, time.time() - entered), phase=previous.value
+            )
         if error is not None:
             epoch["error"] = str(error)
         self.store.put(epoch)
@@ -63,6 +68,10 @@ class EpochRunner:
                        errors=errors)
             reason = f"{reason}; abort incomplete on {sorted(errors)}, ranks there are unreleased"
         self._save(epoch, Phase.ABORTED, note=reason, error=reason)
+        metrics.EPOCHS.inc(outcome="aborted", job=epoch["job_id"])
+        metrics.EPOCH_SECONDS.observe(
+            time.time() - epoch["created_at"], outcome="aborted"
+        )
         if errors:
             # Raised here, ahead of the caller's own AbortableError, so the
             # distinction reaches whoever reports on the job.
@@ -74,6 +83,10 @@ class EpochRunner:
     def _fail(self, epoch, reason):
         _LOG.error("epoch lost past commit point", epoch=epoch["epoch_id"], reason=reason)
         self._save(epoch, Phase.FAILED, note=reason, error=reason)
+        metrics.EPOCHS.inc(outcome="failed", job=epoch["job_id"])
+        metrics.EPOCH_SECONDS.observe(
+            time.time() - epoch["created_at"], outcome="failed"
+        )
         raise TerminalError(
             f"epoch {epoch['epoch_id']} failed after the commit point: {reason}. "
             f"Ranks cannot be resumed in place; restore the last good image."
@@ -133,6 +146,8 @@ class EpochRunner:
             for vote in result.get("votes", []):
                 votes[int(vote["rank"])] = vote
         epoch["votes"] = votes
+        for vote in votes.values():
+            metrics.VOTES.inc(verdict=vote["vote"], job=job_id)
 
         if errors:
             self._abort(epoch, f"prepare failed on {sorted(errors)}", init_method)
@@ -173,6 +188,7 @@ class EpochRunner:
             self._abort(epoch, f"lock failed on {sorted(errors)}", init_method)
             raise AbortableError(f"lock failed: {errors}")
         self._save(epoch, Phase.LOCKED)
+        locked_at = time.time()
 
         # ------------------------------------------------ COMMIT POINT below
         # Recorded before the first checkpoint call goes out, not after the
@@ -240,6 +256,10 @@ class EpochRunner:
 
         epoch["seconds"] = round(time.time() - started, 3)
         self.store.put(epoch)
+        metrics.EPOCHS.inc(outcome="succeeded", job=job_id, mode=mode)
+        metrics.EPOCH_SECONDS.observe(epoch["seconds"], outcome="succeeded")
+        # The number an operator feels: how long the job was not running.
+        metrics.STOPPED_SECONDS.observe(time.time() - locked_at, mode=mode)
         _LOG.info(
             "checkpoint complete",
             epoch=epoch["epoch_id"],

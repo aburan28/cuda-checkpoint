@@ -124,7 +124,9 @@ def _deny(uid, message):
 
 
 def patch_response(uid, patches, message="mutated"):
-    """Helper for a mutating variant that injects the job file env var."""
+    """An AdmissionReview response carrying a JSONPatch."""
+    if not patches:
+        return _allow(uid, message)
     encoded = base64.b64encode(json.dumps(patches).encode()).decode()
     return {
         "apiVersion": "admission.k8s.io/v1",
@@ -137,3 +139,127 @@ def patch_response(uid, patches, message="mutated"):
             "status": {"message": message},
         },
     }
+
+
+# ------------------------------------------------------------------ mutation
+
+CONTROL_VOLUME = "mncr-control"
+CONTROL_PATH = "/run/mncr"
+LABEL_JOB = "mncr.io/job-id"
+
+
+def mutate(request, control_root=CONTROL_PATH, job_from_label=("mncr.io/job-id", "job-name")):
+    """Give a checkpointable pod what it needs to be checkpointed.
+
+    Three things, each of which is otherwise a hand-written stanza somebody
+    forgets exactly once:
+
+      the control mount   the rank polls it for its epoch request and the agent
+                          writes there. hostPath, because agent and rank are
+                          different pods
+      MNCR_* env          job id, control root and the agent address, so
+                          torchckpt.init() needs no arguments
+      the job file path   driver 610 IPC, pointing at the file the agent creates
+                          for this job
+
+    Every operation is conditional. A pod that already sets something keeps what
+    it set; the webhook is here to supply defaults, not to overrule authors.
+    """
+    uid = request.get("request", {}).get("uid", "")
+    obj = request.get("request", {}).get("object", {}) or {}
+    metadata = obj.get("metadata", {}) or {}
+    labels = metadata.get("labels", {}) or {}
+
+    if labels.get(LABEL_CHECKPOINTABLE, "false").lower() not in ("true", "1", "yes"):
+        return _allow(uid, "not labelled checkpointable")
+
+    job_id = next((labels[key] for key in job_from_label if labels.get(key)), None)
+    if not job_id:
+        return _allow(
+            uid,
+            f"checkpointable but no job label ({' or '.join(job_from_label)}); "
+            f"nothing injected",
+        )
+
+    spec = obj.get("spec", {}) or {}
+    patches = []
+    notes = []
+
+    volumes = spec.get("volumes")
+    have_volume = any(v.get("name") == CONTROL_VOLUME for v in volumes or [])
+    already_mounted = any(
+        m.get("mountPath") == control_root
+        for container in spec.get("containers", [])
+        for m in container.get("volumeMounts", []) or []
+    )
+
+    if not have_volume and not already_mounted:
+        volume = {
+            "name": CONTROL_VOLUME,
+            "hostPath": {"path": control_root, "type": "DirectoryOrCreate"},
+        }
+        if volumes is None:
+            patches.append({"op": "add", "path": "/spec/volumes", "value": [volume]})
+        else:
+            patches.append({"op": "add", "path": "/spec/volumes/-", "value": volume})
+        notes.append("control volume")
+
+    for index, container in enumerate(spec.get("containers", [])):
+        mounts = container.get("volumeMounts")
+        mounted = any((m.get("mountPath") == control_root) for m in mounts or [])
+        if not mounted and not already_mounted:
+            mount = {"name": CONTROL_VOLUME, "mountPath": control_root}
+            if mounts is None:
+                patches.append(
+                    {
+                        "op": "add",
+                        "path": f"/spec/containers/{index}/volumeMounts",
+                        "value": [mount],
+                    }
+                )
+            else:
+                patches.append(
+                    {
+                        "op": "add",
+                        "path": f"/spec/containers/{index}/volumeMounts/-",
+                        "value": mount,
+                    }
+                )
+
+        env = container.get("env")
+        present = {e.get("name") for e in env or []}
+        wanted = {
+            "MNCR_JOB_ID": job_id,
+            "MNCR_CONTROL_ROOT": control_root,
+            "MNCR_RANK_ADDR": f"unix:{control_root}/agent.sock",
+            "CUDA_CHECKPOINT_JOB_FILE": f"{control_root}/jobs/{job_id}.jobfile",
+        }
+        missing = [
+            {"name": name, "value": value}
+            for name, value in wanted.items()
+            if name not in present
+        ]
+        if not missing:
+            continue
+        if env is None:
+            patches.append(
+                {
+                    "op": "add",
+                    "path": f"/spec/containers/{index}/env",
+                    "value": missing,
+                }
+            )
+        else:
+            for entry in missing:
+                patches.append(
+                    {
+                        "op": "add",
+                        "path": f"/spec/containers/{index}/env/-",
+                        "value": entry,
+                    }
+                )
+        notes.append(f"{len(missing)} env vars into {container.get('name', index)}")
+
+    if not patches:
+        return _allow(uid, "already configured for checkpointing")
+    return patch_response(uid, patches, f"injected {'; '.join(notes)}")

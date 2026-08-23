@@ -21,7 +21,7 @@ import shutil
 import threading
 import time
 
-from mncr import config, log, rpc
+from mncr import config, log, metrics, rpc
 from mncr.errors import DriverError, PreconditionError
 from mncr.proto import Vote
 from torchckpt.channel import ControlDir
@@ -132,6 +132,7 @@ class Agent:
         # registration is also how it learns a pid exists.
         if isinstance(self.driver, driver_mod.FakeBackend):
             self.driver.add_pid(host_pid)
+        metrics.RANKS.set(len(self._ranks), node=self.node)
         _LOG.info("rank registered", job=job_id, rank=rank, pid=host_pid, pid_from=how,
                   node=self.node)
         return {"node": self.node, "registered": True, "host_pid": host_pid}
@@ -158,6 +159,11 @@ class Agent:
         if event:
             event.set()
         _LOG.info("vote", job=job_id, rank=rank, epoch=epoch_id, vote=vote)
+        for finding in findings or []:
+            metrics.GATE_FINDINGS.inc(
+                gate="rank_self_check", kind=finding.get("kind", "unknown"),
+                node=self.node,
+            )
         return {"accepted": True}
 
     # ------------------------------------------------------------ local view
@@ -290,8 +296,9 @@ class Agent:
         try:
             for record in local:
                 pid = record["host_pid"]
-                self.verifier.before_lock(pid)
-                self.driver.lock(pid, timeout_ms)
+                self._gate(self.verifier.before_lock, pid, "before_lock")
+                with metrics.DRIVER_SECONDS.time(action="lock", node=self.node):
+                    self._driver_call(self.driver.lock, "lock", pid, timeout_ms)
                 locked.append(pid)
         except Exception:
             # Still abortable: undo the partial lock before propagating.
@@ -313,7 +320,8 @@ class Agent:
         done = []
         for record in local:
             pid = record["host_pid"]
-            self.driver.checkpoint(pid)
+            with metrics.DRIVER_SECONDS.time(action="checkpoint", node=self.node):
+                self._driver_call(self.driver.checkpoint, "checkpoint", pid)
             done.append(pid)
         with self._lock:
             self._checkpointed[(job_id, epoch_id)] = done
@@ -327,7 +335,7 @@ class Agent:
         images, entries = [], []
         for record in local:
             pid = record["host_pid"]
-            self.verifier.before_dump(pid)
+            self._gate(self.verifier.before_dump, pid, "before_dump")
             images_dir = os.path.join(image_root, epoch_id, f"rank-{record['rank']}")
             self.criu.dump(pid, images_dir, external=external or ())
             images.append({"rank": record["rank"], "path": images_dir, "pid": pid})
@@ -342,6 +350,7 @@ class Agent:
 
         manifest_path = None
         if store and entries:
+            store_started = time.time()
             # Shard, compress and checksum. A cross-node restore has no other
             # way to reach these images: they are on this node's disk.
             manifest = self.pipeline.store_epoch(
@@ -353,6 +362,11 @@ class Agent:
                 world_size=len(entries),
             )
             manifest_path = manifest.save(self._manifest_path(image_root, epoch_id))
+            metrics.IMAGE_SECONDS.observe(
+                time.time() - store_started, node=self.node
+            )
+            for rank_image in manifest.ranks:
+                metrics.IMAGE_BYTES.observe(rank_image.stored_bytes, node=self.node)
 
         _LOG.info(
             "dumped",
@@ -489,6 +503,23 @@ class Agent:
                 return manifest
         return None
 
+    def _driver_call(self, fn, action, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            metrics.DRIVER_ERRORS.inc(action=action, node=self.node)
+            raise
+
+    def _gate(self, fn, pid, gate):
+        try:
+            return fn(pid)
+        except Exception as exc:
+            for finding in getattr(exc, "findings", []) or []:
+                metrics.GATE_FINDINGS.inc(
+                    gate=gate, kind=finding.kind, node=self.node
+                )
+            raise
+
     def _restore_targets(self, job_id, ranks, from_images):
         """Records to restore.
 
@@ -569,6 +600,7 @@ class Agent:
                 ]
             for key in dropped:
                 self._ranks.pop(key, None)
+            metrics.RANKS.set(len(self._ranks), node=self.node)
         _LOG.info("ranks relinquished", job=job_id, node=self.node,
                   ranks=[k[1] for k in dropped])
         return {"node": self.node, "forgotten": [k[1] for k in dropped]}
@@ -666,6 +698,8 @@ def main(argv=None):
     ap.add_argument("--rank-addr", default=None, help="address ranks connect to")
     ap.add_argument("--node", default=None)
     ap.add_argument("--control-root", default=None)
+    ap.add_argument("--metrics-port", type=int, default=9180,
+                    help="Prometheus endpoint; 0 disables it")
     args = ap.parse_args(argv)
 
     cfg = config.load()
@@ -675,7 +709,10 @@ def main(argv=None):
     if rank_addr and rank_addr != (args.addr or cfg.agent_addr):
         servers.append(build_server(agent, rank_addr).start())
 
-    _LOG.info("agent ready", node=agent.node, fake=cfg.fake)
+    metrics_server = metrics.serve(args.metrics_port) if args.metrics_port else None
+    _LOG.info(
+        "agent ready", node=agent.node, fake=cfg.fake, metrics=args.metrics_port or None
+    )
     try:
         while True:
             time.sleep(3600)
@@ -684,6 +721,9 @@ def main(argv=None):
     finally:
         for server in servers:
             server.stop()
+        if metrics_server:
+            metrics_server.shutdown()
+            metrics_server.server_close()
     return 0
 
 

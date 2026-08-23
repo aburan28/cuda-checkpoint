@@ -25,6 +25,8 @@
 | — | operator CLI | `mncrctl` | exercised against a live coordinator |
 | — | node preflight | `agent/preflight.py` | real backends; runs as a DaemonSet init container |
 | — | on-node smoke test | `verify/smoke.py`, `verify/smoke_target.cu` | four levels; skips cleanly without hardware |
+| — | mutating admission | `k8s/admission.py` | injects mount, env and job-file path; never overrides an author |
+| — | metrics | `mncr/metrics.py` | Prometheus text; aborted and failed kept as separate series |
 | P7 | NCCL seam + benchmark | `ncclx/` | seam refuses the unsafe fast path; patch specified |
 | P8 | simulator, chaos, scale | `verify/` | all green |
 
@@ -32,8 +34,6 @@
 
 * The NCCL network-suspend patch itself. It needs the NCCL source tree;
   `ncclx/README.md` specifies it.
-* A mutating webhook to inject the job-file env var. `k8s/admission.py` has the
-  helper; the validating path is what is wired.
 * TLS certificate issuance for the webhook. The Deployment mounts
   `mncr-admission-tls`; producing it is left to cert-manager or your own CA.
 * Object-store credentials handling. `RemoteBackend` shells to whatever CLI the

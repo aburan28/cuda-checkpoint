@@ -12,6 +12,9 @@ spec:
   template:
     metadata:
       labels: {app: mncr-coordinator}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9181"
     spec:
       serviceAccountName: mncr-coordinator
       containers:
@@ -28,6 +31,7 @@ spec:
               value: "900"
           ports:
             - {name: rpc, containerPort: 7180}
+            - {name: metrics, containerPort: 9181}
           volumeMounts:
             - {name: epochs, mountPath: /var/lib/mncr/epochs}
           resources:
@@ -56,3 +60,4 @@ spec:
   selector: {app: mncr-coordinator}
   ports:
     - {name: rpc, port: 7180, targetPort: 7180}
+    - {name: metrics, port: 9181, targetPort: 9181}

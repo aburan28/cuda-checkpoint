@@ -9,7 +9,7 @@ state only the controller understood.
 import argparse
 import time
 
-from mncr import config, log
+from mncr import config, log, metrics
 from mncr.errors import AbortableError, TerminalError
 
 from .client import K8sClient
@@ -168,6 +168,9 @@ class Controller:
                 "consecutiveFailures": failures,
                 "lastAttemptAt": _now(),
             }
+            metrics.POLICY_SUSPENDED.set(
+                1 if failures >= limit else 0, policy=name, job=job_id
+            )
             if failures >= limit:
                 # Retrying a policy that has failed repeatedly turns one broken
                 # job into a source of load on every node it touches. Stop, and
@@ -258,6 +261,7 @@ def main(argv=None):
     ap.add_argument("--namespace", default=None)
     ap.add_argument("--agents", default="", help="node=addr,node=addr")
     ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--metrics-port", type=int, default=9181)
     args = ap.parse_args(argv)
 
     agents = {}
@@ -266,6 +270,8 @@ def main(argv=None):
         agents[node] = addr
 
     coord = Coordinator(config.load(), agents=agents)
+    if args.metrics_port:
+        metrics.serve(args.metrics_port)
     Controller(coord, namespace=args.namespace, poll_interval=args.interval).run()
     return 0
 

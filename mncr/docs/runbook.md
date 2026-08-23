@@ -70,6 +70,23 @@ Check the node label and the webhook.
 * Job files are single-use and node-local. Delete a job before relaunching it.
 * Restoring across driver major versions is not guaranteed and is refused.
 
+## What to watch
+
+Two series, and the distinction between them is the whole operational model:
+
+```
+mncr_epochs_total{outcome="aborted"}   failed before the commit point
+mncr_epochs_total{outcome="failed"}    failed after it
+```
+
+An `aborted` rate above zero is a bug to fix at leisure - the job survived every
+one of them. A single `failed` means a job was lost. Alert on the second
+immediately; trend the first.
+
+Beyond those: `mncr_stopped_seconds` is the number users feel, and
+`mncr_gate_findings_total{kind=...}` tells you exactly which resource ranks keep
+failing to release, which is usually the fastest route to the cause.
+
 ## Retention
 
 `CheckpointPolicy.spec.retain` bounds how many images a job keeps; the

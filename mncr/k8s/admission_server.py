@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mncr import log  # noqa: E402
 from mncr.version import MIN_DRIVER  # noqa: E402
 
-from .admission import review  # noqa: E402
+from .admission import mutate, review  # noqa: E402
 from .client import K8sClient, K8sError  # noqa: E402
 
 _LOG = log.get("k8s.admission")
@@ -88,7 +88,8 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path != self.server.path:
+        handler = self.server.routes.get(self.path)
+        if handler is None:
             self._respond(404, {"error": "not found"})
             return
         try:
@@ -99,12 +100,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            response = review(
-                request,
-                node_lookup=self.server.nodes.get,
-                min_driver=self.server.min_driver,
-                allow_mnnvl=self.server.allow_mnnvl,
-            )
+            response = handler(self, request)
         except Exception as exc:  # noqa: BLE001
             # An admission controller that throws blocks scheduling. Allow, and
             # be loud about why the decision was not made.
@@ -122,17 +118,32 @@ class Handler(BaseHTTPRequestHandler):
 
         decision = response["response"]
         _LOG.info(
-            "review",
+            self.path.lstrip("/") or "review",
             allowed=decision["allowed"],
             message=decision.get("status", {}).get("message", "")[:120],
         )
         self._respond(200, response)
 
 
-def build(port=8443, path="/validate", certfile=None, keyfile=None, client=None,
-          allow_mnnvl=False, min_driver=MIN_DRIVER):
+def _do_validate(handler, request):
+    return review(
+        request,
+        node_lookup=handler.server.nodes.get,
+        min_driver=handler.server.min_driver,
+        allow_mnnvl=handler.server.allow_mnnvl,
+    )
+
+
+def _do_mutate(handler, request):
+    return mutate(request, control_root=handler.server.control_root)
+
+
+def build(port=8443, path="/validate", mutate_path="/mutate", certfile=None,
+          keyfile=None, client=None, allow_mnnvl=False, min_driver=MIN_DRIVER,
+          control_root="/run/mncr"):
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    server.path = path
+    server.routes = {path: _do_validate, mutate_path: _do_mutate}
+    server.control_root = control_root
     server.nodes = NodeCache(client or K8sClient())
     server.allow_mnnvl = allow_mnnvl
     server.min_driver = min_driver
@@ -153,6 +164,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="mncr admission webhook")
     ap.add_argument("--port", type=int, default=8443)
     ap.add_argument("--path", default="/validate")
+    ap.add_argument("--mutate-path", default="/mutate")
+    ap.add_argument("--control-root", default=os.environ.get("MNCR_CONTROL_ROOT", "/run/mncr"))
     ap.add_argument("--cert", default=os.environ.get("MNCR_TLS_CERT", "/tls/tls.crt"))
     ap.add_argument("--key", default=os.environ.get("MNCR_TLS_KEY", "/tls/tls.key"))
     ap.add_argument("--allow-mnnvl", action="store_true")
@@ -160,8 +173,17 @@ def main(argv=None):
 
     cert = args.cert if os.path.exists(args.cert) else None
     key = args.key if os.path.exists(args.key) else None
-    server = build(args.port, args.path, cert, key, allow_mnnvl=args.allow_mnnvl)
-    _LOG.info("admission listening", port=args.port, path=args.path, tls=bool(cert))
+    server = build(
+        args.port, args.path, args.mutate_path, cert, key,
+        allow_mnnvl=args.allow_mnnvl, control_root=args.control_root,
+    )
+    _LOG.info(
+        "admission listening",
+        port=args.port,
+        validate=args.path,
+        mutate=args.mutate_path,
+        tls=bool(cert),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
