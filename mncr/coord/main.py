@@ -1,0 +1,202 @@
+"""Coordinator service and CLI.
+
+Holds no GPU state and issues no privileged call. Its entire job is deciding
+when it is safe to cross the commit point, and remembering what happened.
+"""
+
+import argparse
+import json
+import time
+
+from mncr import config, log, rpc
+from mncr.proto import RankRef
+
+from .client import AgentPool
+from .epoch import EpochRunner
+from .placement import ImageRequirements, select
+from .devicemap import build_pairs, to_cli
+from .store import EpochStore
+
+_LOG = log.get("coord")
+
+
+class Coordinator:
+    def __init__(self, cfg=None, agents=None, store=None, node_info=None):
+        self.cfg = cfg or config.load()
+        self.pool = AgentPool(agents or {})
+        self.store = store or EpochStore()
+        self.node_info = dict(node_info or {})
+        self.runner = EpochRunner(self.pool, self.store, self.cfg, self.node_info)
+        self._jobs = {}   # job_id -> [RankRef]
+
+    # --------------------------------------------------------------- ops
+    def register_agent(self, node, addr, info=None):
+        self.pool.add(node, addr)
+        if info:
+            self.node_info[node] = info
+            self.runner.node_info[node] = info
+        _LOG.info("agent registered", node=node, addr=addr)
+        return {"registered": True, "nodes": self.pool.nodes()}
+
+    def register_job(self, job_id, ranks):
+        refs = [RankRef(r) for r in ranks]
+        self._jobs[job_id] = refs
+        _LOG.info("job registered", job=job_id, ranks=len(refs), nodes=len({r["node"] for r in refs}))
+        return {"job_id": job_id, "ranks": len(refs)}
+
+    def job_ranks(self, job_id):
+        if job_id not in self._jobs:
+            raise KeyError(f"unknown job {job_id}")
+        return self._jobs[job_id]
+
+    def checkpoint(self, job_id, mode="continue", image_root=None, init_method=None,
+                   reason="manual", pre_dump=False):
+        epoch = self.runner.checkpoint(
+            job_id,
+            self.job_ranks(job_id),
+            mode=mode,
+            image_root=image_root,
+            init_method=init_method,
+            reason=reason,
+            pre_dump=pre_dump,
+        )
+        return {"epoch_id": epoch["epoch_id"], "phase": epoch["phase"],
+                "images": len(epoch.get("images", [])), "seconds": epoch.get("seconds")}
+
+    def restore(self, job_id, epoch_id, targets=None, image_root=None, init_method=None):
+        """Restore onto `targets` ({node: [ranks]}), defaulting to where it ran."""
+        source = self.store.get(epoch_id)
+        if source is None:
+            raise KeyError(f"unknown epoch {epoch_id}")
+
+        if targets:
+            ranks, device_maps = self._replace_placement(source, targets)
+        else:
+            ranks = [RankRef(r) for r in source["ranks"]]
+            device_maps = {
+                node: to_cli(
+                    build_pairs(
+                        self._node_uuids(node), self._node_uuids(node)
+                    )
+                )
+                for node in {r["node"] for r in ranks}
+                if self._node_uuids(node)
+            }
+
+        epoch = self.runner.restore(
+            job_id, epoch_id, ranks, image_root=image_root,
+            device_maps=device_maps, init_method=init_method,
+        )
+        self._jobs[job_id] = ranks
+        return {"epoch_id": epoch_id, "phase": epoch["phase"],
+                "device_maps": device_maps}
+
+    def _node_uuids(self, node):
+        info = self.node_info.get(node) or {}
+        raw = info.get("gpu_uuids") or ""
+        return [u for u in str(raw).split("|") if u]
+
+    def _replace_placement(self, source, targets):
+        """Re-place ranks onto new nodes and build each node's device map."""
+        source_nodes = source.get("ranks", [])
+        by_rank = {int(r["rank"]): r for r in source_nodes}
+        ranks, device_maps = [], {}
+        for node, rank_ids in targets.items():
+            src_node = by_rank[int(rank_ids[0])]["node"] if rank_ids else None
+            src_uuids = self._node_uuids(src_node) if src_node else []
+            dst_uuids = self._node_uuids(node)
+            if src_uuids and dst_uuids:
+                device_maps[node] = to_cli(build_pairs(src_uuids, dst_uuids))
+            for rank_id in rank_ids:
+                original = by_rank[int(rank_id)]
+                ranks.append(RankRef({**original, "node": node}))
+        return ranks, device_maps
+
+    def plan_restore(self, epoch_id, node_count, allow_mnnvl=None):
+        """Which nodes could host this image, and why the rest cannot."""
+        last = self.store.get(epoch_id) or {}
+        job_id = last.get("job_id")
+        good = self.store.last_good(job_id) if job_id else None
+        req = ImageRequirements(**(good or {}).get("requirements", {})) if good else None
+        if req is None:
+            raise KeyError(f"no recorded requirements for {epoch_id}")
+        chosen, rejected = select(
+            req,
+            list(self.node_info.values()),
+            node_count,
+            allow_mnnvl=self.cfg.allow_mnnvl if allow_mnnvl is None else allow_mnnvl,
+        )
+        return {"nodes": [n.get("host") for n in chosen], "rejected": rejected}
+
+    def status(self, job_id=None):
+        return {
+            "nodes": self.pool.nodes(),
+            "jobs": {j: len(r) for j, r in self._jobs.items()},
+            "epochs": [
+                {k: e.get(k) for k in ("epoch_id", "job_id", "phase", "seconds")}
+                for e in self.store.list_epochs(job_id)[-20:]
+            ],
+        }
+
+    def recover(self):
+        """What a coordinator restart found. Reported, never auto-resumed."""
+        recoverable, lost = self.store.in_flight()
+        for epoch in lost:
+            _LOG.error(
+                "epoch was past the commit point at coordinator restart",
+                epoch=epoch.get("epoch_id"),
+                phase=epoch.get("phase"),
+            )
+        return {
+            "abortable": [e["epoch_id"] for e in recoverable],
+            "lost": [e["epoch_id"] for e in lost],
+        }
+
+
+def build_server(coord, addr=None):
+    server = rpc.Server(addr or coord.cfg.coord_addr, name="coord")
+    for name in (
+        "register_agent",
+        "register_job",
+        "checkpoint",
+        "restore",
+        "plan_restore",
+        "status",
+        "recover",
+    ):
+        server.op(name)(getattr(coord, name))
+    return server
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="mncr coordinator")
+    ap.add_argument("--addr", default=None)
+    ap.add_argument("--agents", default="", help="node=addr,node=addr")
+    ap.add_argument("--epoch-dir", default=None)
+    args = ap.parse_args(argv)
+
+    cfg = config.load()
+    agents = {}
+    for pair in filter(None, args.agents.split(",")):
+        node, _, addr = pair.partition("=")
+        agents[node] = addr
+
+    coord = Coordinator(
+        cfg,
+        agents=agents,
+        store=EpochStore(args.epoch_dir) if args.epoch_dir else None,
+    )
+    server = build_server(coord, args.addr or cfg.coord_addr).start()
+    print(json.dumps(coord.recover()))
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

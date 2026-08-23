@@ -1,0 +1,92 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gpucheckpoints.mncr.io
+spec:
+  group: mncr.io
+  scope: Namespaced
+  names:
+    plural: gpucheckpoints
+    singular: gpucheckpoint
+    kind: GpuCheckpoint
+    shortNames: [gckpt]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Job
+          type: string
+          jsonPath: .spec.jobId
+        - name: Mode
+          type: string
+          jsonPath: .spec.mode
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Job-Intact
+          type: boolean
+          jsonPath: .status.jobIntact
+        - name: Seconds
+          type: number
+          jsonPath: .status.seconds
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [jobId]
+              properties:
+                jobId:
+                  type: string
+                  description: Job whose ranks registered with their node agents.
+                mode:
+                  type: string
+                  enum: [continue, stop]
+                  default: continue
+                  description: >-
+                    continue keeps the job running after the image is written;
+                    stop leaves the ranks down, for preemption.
+                imageRoot:
+                  type: string
+                podSelector:
+                  type: string
+                  description: Label selector for pods to delete when mode is stop.
+                deletePodsOnStop:
+                  type: boolean
+                  default: true
+                reason:
+                  type: string
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Succeeded, Failed]
+                reason:
+                  type: string
+                message:
+                  type: string
+                jobIntact:
+                  type: boolean
+                  description: >-
+                    False means the epoch failed past the commit point and the
+                    ranks cannot be resumed in place. Restore the last good image.
+                epochId:
+                  type: string
+                imageId:
+                  type: string
+                images:
+                  type: integer
+                seconds:
+                  type: number
+                startedAt:
+                  type: string
+                finishedAt:
+                  type: string

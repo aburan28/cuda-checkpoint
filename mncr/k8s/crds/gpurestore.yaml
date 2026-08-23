@@ -1,0 +1,71 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gpurestores.mncr.io
+spec:
+  group: mncr.io
+  scope: Namespaced
+  names:
+    plural: gpurestores
+    singular: gpurestore
+    kind: GpuRestore
+    shortNames: [grst]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Job
+          type: string
+          jsonPath: .spec.jobId
+        - name: Epoch
+          type: string
+          jsonPath: .spec.epochId
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [jobId, epochId]
+              properties:
+                jobId:
+                  type: string
+                epochId:
+                  type: string
+                imageRoot:
+                  type: string
+                targets:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items:
+                      type: integer
+                  description: >-
+                    node name to rank ids. Omit to restore onto the original
+                    nodes. A device map is always built, even for an in-place
+                    restore, because GPU UUIDs identify specific devices.
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Running, Succeeded, Failed]
+                message:
+                  type: string
+                deviceMaps:
+                  type: object
+                  additionalProperties:
+                    type: string
+                startedAt:
+                  type: string
+                finishedAt:
+                  type: string

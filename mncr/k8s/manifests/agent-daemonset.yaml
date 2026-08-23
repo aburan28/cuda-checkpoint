@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: mncr-agent
+  namespace: mncr-system
+  labels: {app: mncr-agent}
+spec:
+  selector:
+    matchLabels: {app: mncr-agent}
+  template:
+    metadata:
+      labels: {app: mncr-agent}
+    spec:
+      serviceAccountName: mncr-agent
+      # hostPID is what makes the driver calls possible at all: cuda-checkpoint
+      # takes host pids, and the ranks live in their own pid namespaces.
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      nodeSelector:
+        mncr.io/checkpointable: "true"
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: agent
+          image: ghcr.io/example/mncr-agent:0.1.0
+          imagePullPolicy: IfNotPresent
+          command: [python3, -m, agent.main]
+          args: ["--addr", "tcp:0.0.0.0:7181", "--rank-addr", "unix:/run/mncr/agent.sock"]
+          securityContext:
+            privileged: true            # CRIU requires it; there is no smaller set
+            capabilities:
+              add: [SYS_ADMIN, SYS_PTRACE, SYS_RESOURCE, NET_ADMIN, CHECKPOINT_RESTORE]
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: MNCR_CONTROL_ROOT
+              value: /run/mncr
+            - name: MNCR_IMAGE_DIR
+              value: /var/lib/mncr/images
+            - name: MNCR_LOCK_TIMEOUT_MS
+              value: "60000"
+          ports:
+            - {name: rpc, containerPort: 7181, hostPort: 7181}
+          volumeMounts:
+            # Shared with every rank pod: the control directory the ranks poll.
+            - {name: control, mountPath: /run/mncr}
+            - {name: images, mountPath: /var/lib/mncr}
+            - {name: proc, mountPath: /host/proc}
+            - {name: dev, mountPath: /dev}
+            - {name: criu-lib, mountPath: /usr/lib/criu, readOnly: true}
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits: {memory: 4Gi}
+          livenessProbe:
+            tcpSocket: {port: 7181}
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: control
+          hostPath: {path: /run/mncr, type: DirectoryOrCreate}
+        - name: images
+          hostPath: {path: /var/lib/mncr, type: DirectoryOrCreate}
+        - name: proc
+          hostPath: {path: /proc}
+        - name: dev
+          hostPath: {path: /dev}
+        - name: criu-lib
+          hostPath: {path: /usr/lib/criu, type: DirectoryOrCreate}

@@ -1,0 +1,297 @@
+"""Two-phase commit across nodes.
+
+The rule this file exists to enforce: collect every vote before issuing a single
+checkpoint call. Before the commit point a failure costs one drained step; after
+it, the affected ranks have released their GPU resources and the driver offers
+no way back, so the epoch is lost and the job falls back to its last good image.
+
+Everything else here is bookkeeping around that rule.
+"""
+
+import time
+
+from mncr import log
+from mncr.errors import AbortableError, TerminalError
+from mncr.proto import Epoch, Phase, Vote
+
+_LOG = log.get("coord.epoch")
+
+
+class EpochRunner:
+    def __init__(self, pool, store, cfg, node_info=None):
+        self.pool = pool
+        self.store = store
+        self.cfg = cfg
+        self.node_info = node_info or {}
+
+    # ------------------------------------------------------------- utilities
+    def _save(self, epoch, phase=None, note=None, error=None):
+        if phase is not None:
+            epoch.set_phase(phase, note)
+        if error is not None:
+            epoch["error"] = str(error)
+        self.store.put(epoch)
+        return epoch
+
+    def _per_node_ranks(self, epoch):
+        return {
+            node: {"ranks": [r["rank"] for r in epoch.ranks_on(node)]}
+            for node in epoch.nodes()
+        }
+
+    def _abort(self, epoch, reason, init_method=None):
+        """Undo an epoch that has not committed. Best effort by design."""
+        _LOG.warn("aborting epoch", epoch=epoch["epoch_id"], reason=reason)
+        results, errors = self.pool.fanout(
+            epoch.nodes(),
+            "abort",
+            per_node_args=self._per_node_ranks(epoch),
+            job_id=epoch["job_id"],
+            epoch_id=epoch["epoch_id"],
+            reason=reason,
+            init_method=init_method,
+            world_size=len(epoch["ranks"]),
+        )
+        if errors:
+            # A node that cannot even unlock leaves ranks stuck; surface it
+            # loudly, but the epoch is still aborted rather than committed.
+            _LOG.error("abort incomplete", epoch=epoch["epoch_id"], errors=errors)
+        self._save(epoch, Phase.ABORTED, note=reason, error=reason)
+        return results, errors
+
+    def _fail(self, epoch, reason):
+        _LOG.error("epoch lost past commit point", epoch=epoch["epoch_id"], reason=reason)
+        self._save(epoch, Phase.FAILED, note=reason, error=reason)
+        raise TerminalError(
+            f"epoch {epoch['epoch_id']} failed after the commit point: {reason}. "
+            f"Ranks cannot be resumed in place; restore the last good image."
+        )
+
+    # -------------------------------------------------------------- the flow
+    def checkpoint(self, job_id, ranks, mode="continue", image_root=None,
+                   init_method=None, reason="manual", pre_dump=False):
+        """Run one checkpoint epoch.
+
+        mode="continue"  checkpoint and keep the job running (fault tolerance)
+        mode="stop"      checkpoint and leave the ranks down (preemption)
+        pre_dump=True    copy pages before the lock, shrinking the stop window
+        """
+        image_root = image_root or self.cfg.image_dir
+        epoch = Epoch.make(job_id, ranks, reason=reason)
+        self.store.put(epoch)
+        started = time.time()
+        per_node = self._per_node_ranks(epoch)
+        nodes = epoch.nodes()
+
+        # --------------------------------------------------------- pre-dump
+        if pre_dump:
+            # Before the lock on purpose: this is the only window where the
+            # process is still running and its pages are worth copying early.
+            _results, errors = self.pool.fanout(
+                nodes,
+                "pre_dump",
+                per_node_args=per_node,
+                job_id=job_id,
+                epoch_id=epoch["epoch_id"],
+                image_root=image_root,
+                _timeout=self.cfg.dump_timeout,
+            )
+            if errors:
+                # A failed pre-dump costs time, not correctness. Carry on.
+                _LOG.warn("pre-dump incomplete", epoch=epoch["epoch_id"], errors=errors)
+
+        # ---------------------------------------------------------- prepare
+        self._save(epoch, Phase.PREPARING)
+        results, errors = self.pool.fanout(
+            nodes,
+            "prepare",
+            per_node_args=per_node,
+            job_id=job_id,
+            epoch_id=epoch["epoch_id"],
+            wait_timeout=self.cfg.checkpoint_timeout,
+            vote_timeout=self.cfg.quiesce_timeout,
+            _timeout=self.cfg.quiesce_timeout + 60,
+        )
+        votes = {}
+        for node, result in results.items():
+            for vote in result.get("votes", []):
+                votes[vote["rank"]] = vote
+        epoch["votes"] = votes
+
+        if errors:
+            self._abort(epoch, f"prepare failed on {sorted(errors)}", init_method)
+            raise AbortableError(f"prepare failed: {errors}")
+
+        dirty = [v for v in votes.values() if v["vote"] != Vote.CLEAN.value]
+        if dirty:
+            detail = ", ".join(
+                f"rank {v['rank']}: {v['vote']}"
+                + (f" ({v.get('error')})" if v.get("error") else "")
+                for v in dirty[:8]
+            )
+            self._abort(epoch, f"ranks not clean: {detail}", init_method)
+            raise AbortableError(f"ranks not clean: {detail}")
+
+        self._save(epoch, Phase.PREPARED, note=f"{len(votes)} clean votes")
+
+        # ------------------------------------------------------------- lock
+        results, errors = self.pool.fanout(
+            nodes,
+            "lock",
+            per_node_args=per_node,
+            job_id=job_id,
+            epoch_id=epoch["epoch_id"],
+            timeout_ms=self.cfg.lock_timeout_ms,
+            _timeout=(self.cfg.lock_timeout_ms / 1000.0) + 120,
+        )
+        if errors:
+            self._abort(epoch, f"lock failed on {sorted(errors)}", init_method)
+            raise AbortableError(f"lock failed: {errors}")
+        self._save(epoch, Phase.LOCKED)
+
+        # ------------------------------------------------ COMMIT POINT below
+        results, errors = self.pool.fanout(
+            nodes,
+            "checkpoint",
+            per_node_args=per_node,
+            job_id=job_id,
+            epoch_id=epoch["epoch_id"],
+            _timeout=self.cfg.checkpoint_timeout,
+        )
+        self._save(epoch, Phase.CHECKPOINTED)
+        if errors:
+            self._fail(epoch, f"checkpoint failed on {sorted(errors)}: {errors}")
+
+        # ------------------------------------------------------------- dump
+        results, errors = self.pool.fanout(
+            nodes,
+            "dump",
+            per_node_args=per_node,
+            job_id=job_id,
+            epoch_id=epoch["epoch_id"],
+            image_root=image_root,
+            _timeout=self.cfg.dump_timeout,
+        )
+        if errors:
+            self._fail(epoch, f"dump failed on {sorted(errors)}: {errors}")
+
+        images = []
+        for node, result in results.items():
+            for image in result.get("images", []):
+                images.append({**image, "node": node})
+        epoch["image_id"] = epoch["epoch_id"]
+        epoch["images"] = images
+        self._save(epoch, Phase.DUMPED, note=f"{len(images)} images")
+
+        requirements = self._requirements_for(nodes)
+        self.store.mark_last_good(job_id, epoch["epoch_id"], epoch["image_id"], requirements)
+
+        # ----------------------------------------------------- put it back
+        if mode == "continue":
+            results, errors = self.pool.fanout(
+                nodes,
+                "restore",
+                per_node_args=per_node,
+                job_id=job_id,
+                epoch_id=epoch["epoch_id"],
+                image_root=image_root,
+                from_images=False,   # the processes never died
+                init_method=init_method,
+                world_size=len(epoch["ranks"]),
+                _timeout=self.cfg.checkpoint_timeout,
+            )
+            if errors:
+                self._fail(epoch, f"resume failed on {sorted(errors)}: {errors}")
+            self._save(epoch, Phase.RESTORING)
+            self._save(epoch, Phase.RESUMED)
+            self._save(epoch, Phase.RUNNING, note="checkpoint and continue")
+        else:
+            _LOG.info("epoch left stopped", epoch=epoch["epoch_id"], mode=mode)
+
+        epoch["seconds"] = round(time.time() - started, 3)
+        self.store.put(epoch)
+        _LOG.info(
+            "checkpoint complete",
+            epoch=epoch["epoch_id"],
+            job=job_id,
+            mode=mode,
+            seconds=epoch["seconds"],
+            images=len(images),
+        )
+        return epoch
+
+    # ----------------------------------------------------------- restore
+    def restore(self, job_id, epoch_id, ranks, image_root=None, device_maps=None,
+                init_method=None):
+        """Bring a dumped job back, possibly onto different nodes.
+
+        device_maps is {node: "old=new,..."} because each node's target UUIDs
+        differ. A node restoring onto its original hardware still gets an
+        explicit identity map rather than None - being explicit here is what
+        makes a wrong map a placement error instead of a silent mis-restore.
+        """
+        image_root = image_root or self.cfg.image_dir
+        stored = self.store.get(epoch_id)
+        epoch = Epoch(stored or Epoch.make(job_id, ranks, reason="restore"))
+        previous = {int(r["rank"]): r["node"] for r in epoch.get("ranks", [])}
+        epoch["ranks"] = [dict(r) for r in ranks]
+        epoch["phase"] = Phase.DUMPED.value
+        self._save(epoch, Phase.RESTORING)
+
+        per_node = self._per_node_ranks(epoch)
+        device_maps = device_maps or {}
+        args = {
+            node: {**per_node[node], "device_map": device_maps.get(node)}
+            for node in epoch.nodes()
+        }
+        results, errors = self.pool.fanout(
+            epoch.nodes(),
+            "restore",
+            per_node_args=args,
+            job_id=job_id,
+            epoch_id=epoch_id,
+            image_root=image_root,
+            from_images=True,
+            init_method=init_method,
+            world_size=len(epoch["ranks"]),
+            _timeout=self.cfg.dump_timeout,
+        )
+        if errors:
+            self._fail(epoch, f"restore failed on {sorted(errors)}: {errors}")
+
+        self._relinquish(job_id, previous, ranks)
+        self._save(epoch, Phase.RESUMED)
+        self._save(epoch, Phase.RUNNING, note="restored from images")
+        _LOG.info("restore complete", epoch=epoch_id, job=job_id, nodes=len(results))
+        return epoch
+
+    def _relinquish(self, job_id, previous, ranks):
+        """Have the old nodes drop ranks that moved elsewhere."""
+        now = {int(r["rank"]): r["node"] for r in ranks}
+        moved = {}
+        for rank, old_node in previous.items():
+            new_node = now.get(rank)
+            if new_node and new_node != old_node:
+                moved.setdefault(old_node, []).append(rank)
+        if not moved:
+            return {}
+        results, errors = self.pool.fanout(
+            list(moved),
+            "forget",
+            per_node_args={node: {"ranks": ranks_} for node, ranks_ in moved.items()},
+            job_id=job_id,
+        )
+        if errors:
+            # A node that cannot let go is not fatal for this restore, but the
+            # next epoch would try to lock a pid that has gone.
+            _LOG.warn("relinquish incomplete", errors=errors, moved=moved)
+        return results
+
+    def _requirements_for(self, nodes):
+        from .placement import ImageRequirements
+
+        for node in nodes:
+            info = self.node_info.get(node)
+            if info:
+                return ImageRequirements.from_node(info).to_dict()
+        return {}

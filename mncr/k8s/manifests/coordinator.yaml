@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mncr-coordinator
+  namespace: mncr-system
+  labels: {app: mncr-coordinator}
+spec:
+  replicas: 1              # single writer; the epoch store is the source of truth
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app: mncr-coordinator}
+  template:
+    metadata:
+      labels: {app: mncr-coordinator}
+    spec:
+      serviceAccountName: mncr-coordinator
+      containers:
+        - name: coordinator
+          image: ghcr.io/example/mncr-coordinator:0.1.0
+          command: [python3, -m, k8s.controller]
+          args: ["--interval", "5"]
+          env:
+            - name: MNCR_COORD_ADDR
+              value: tcp:0.0.0.0:7180
+            - name: MNCR_QUIESCE_TIMEOUT
+              value: "120"
+            - name: MNCR_CHECKPOINT_TIMEOUT
+              value: "900"
+          ports:
+            - {name: rpc, containerPort: 7180}
+          volumeMounts:
+            - {name: epochs, mountPath: /var/lib/mncr/epochs}
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {memory: 1Gi}
+      volumes:
+        - name: epochs
+          persistentVolumeClaim: {claimName: mncr-epochs}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mncr-epochs
+  namespace: mncr-system
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mncr-coordinator
+  namespace: mncr-system
+spec:
+  selector: {app: mncr-coordinator}
+  ports:
+    - {name: rpc, port: 7180, targetPort: 7180}
