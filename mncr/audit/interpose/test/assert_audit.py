@@ -80,11 +80,24 @@ def main(prefix):
     if not fabric:
         problems.append("the FABRIC handle type was not captured in the detail field")
 
+    # Severities follow what was measured on hardware, not what the vendor
+    # documentation says in the aggregate: holding VMM memory is fine, UVM is
+    # not, and importing somebody else's handle is the one that cannot be
+    # restored. See docs/findings-595-blackwell.md.
     severities = {c["api"]: c["severity"] for c in calls}
-    if severities.get("cuMemCreate") != "blocker":
-        problems.append("cuMemCreate was not classified as a blocker")
-    if severities.get("cuIpcGetMemHandle") != "conditional":
-        problems.append("cuIpcGetMemHandle was not classified as conditional")
+    expected = {
+        "cuMemCreate": "conditional",
+        "cuMemMap": "conditional",
+        "cuMemExportToShareableHandle": "conditional",
+        "cuMemAllocManaged": "blocker",
+        "cuMulticastCreate": "blocker",
+        "cuIpcGetMemHandle": "conditional",
+    }
+    for api, want in expected.items():
+        if api in severities and severities[api] != want:
+            problems.append(
+                f"{api} classified {severities[api]!r}, expected {want!r}"
+            )
 
     if problems:
         print("FAIL")

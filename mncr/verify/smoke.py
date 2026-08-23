@@ -143,6 +143,22 @@ def _listed_by_nvidia_smi(pid):
     return str(pid) in proc.stdout.split()
 
 
+def _wait_until_released(pid, timeout=15.0, interval=0.25):
+    """Wait for nvidia-smi to stop listing a checkpointed process.
+
+    The driver call returns before this becomes visible - measured at about a
+    second on a Blackwell node with driver 595. Checking once immediately after
+    the checkpoint reads as "still attached" when it is simply not updated yet,
+    so the question has to be asked with a deadline rather than at an instant.
+    """
+    deadline = time.monotonic() + timeout
+    listed = _listed_by_nvidia_smi(pid)
+    while listed and time.monotonic() < deadline:
+        time.sleep(interval)
+        listed = _listed_by_nvidia_smi(pid)
+    return listed
+
+
 # ---------------------------------------------------------------- the levels
 def level1_driver(cfg, workdir):
     """The vendor's demo, asserted rather than eyeballed."""
@@ -163,9 +179,9 @@ def level1_driver(cfg, workdir):
         driver.lock(target.pid, cfg.lock_timeout_ms)
         driver.checkpoint(target.pid)
 
-        released = _listed_by_nvidia_smi(target.pid)
-        assert released is not False, (
-            "nvidia-smi still lists the process after checkpoint; its GPU "
+        listed = _wait_until_released(target.pid)
+        assert listed is not True, (
+            "nvidia-smi still lists the process 15s after checkpoint; its GPU "
             "resources were not released"
         )
 
@@ -179,7 +195,7 @@ def level1_driver(cfg, workdir):
             "target": target.kind,
             "pid": target.pid,
             "checksum": before["sum"],
-            "gpu_released_while_checkpointed": released,
+            "gpu_released_while_checkpointed": listed is False,
         }
     finally:
         target.stop()

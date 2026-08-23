@@ -8,8 +8,11 @@
 #                        are different pods
 #   the job file env     driver 610 IPC needs it, and the agent creates the file
 #
-# expandable_segments is off until P0's experiment says otherwise: it allocates
-# through the VMM API, which the checkpoint path does not support.
+# expandable_segments was off until P0's experiment answered the question. It
+# allocates through the VMM API, and measurement on driver 595 shows a process
+# merely holding VMM allocations checkpoints and restores cleanly - it is
+# *importing* another process's handle that cannot be restored. So this is left
+# to the workload. See docs/findings-595-blackwell.md.
 apiVersion: v1
 kind: Pod
 metadata:
@@ -39,7 +42,7 @@ spec:
         - name: CUDA_CHECKPOINT_JOB_FILE
           value: /run/mncr/jobs/train-7.jobfile
         - name: PYTORCH_CUDA_ALLOC_CONF
-          value: "expandable_segments:False"
+          value: "expandable_segments:True"
       resources:
         limits: {nvidia.com/gpu: 8}
       volumeMounts:

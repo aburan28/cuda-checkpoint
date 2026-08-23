@@ -218,11 +218,26 @@ Not proven, because it needs hardware:
 `make preflight` and `make smoke` are what close that list, and they are the
 first thing to run on a node.
 
-## Known open question
+## Measured on hardware
 
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` allocates through
-`cuMemCreate`/`cuMemMap`. The documented limitation names the *export*, not the
-allocation. Whether the driver rejects a process merely holding VMM allocations
-decides a fleet-wide policy, and it is not answerable from documentation. Run
-`audit/experiments/expandable_segments.py` on one real node before designing
-around either answer. Until then the manifests set it to `False`.
+The plan's biggest open question is answered. Full results in
+[docs/findings-595-blackwell.md](docs/findings-595-blackwell.md); the two that
+change decisions:
+
+**Expandable segments are fine.** A process merely holding `cuMemCreate` /
+`cuMemMap` allocations checkpoints and restores cleanly on driver 595. The
+manifests no longer force `expandable_segments:False`.
+
+**Exporting is fine; importing is fatal.** The vendor documentation says the
+utility "does not support ... IPC memory created with
+`cuMemExportToShareableHandle()`". Measured, that splits: the *exporting*
+process checkpoints and restores fine even while a peer maps the memory, while
+the *importing* process checkpoints and then fails to restore with `"invalid
+argument"` — past the commit point, and unrecoverable afterwards. Tested in both
+restore orders, so it is the sharing, not the documented ordering rule.
+
+NCCL ranks import each other's handles, so communicator teardown before the lock
+is **required**, not merely tidy. And the failure landing after the commit point
+is this system's central asymmetry, observed rather than argued.
+
+Caveats: driver 595 on a single Blackwell GPU. 610 and multi-GPU are unmeasured.

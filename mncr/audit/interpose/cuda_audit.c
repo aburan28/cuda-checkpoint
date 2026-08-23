@@ -226,8 +226,11 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 {
     REAL("cuMemCreate", fn_memcreate);
     char detail[64];
+    /* Measured on 595: holding VMM allocations does not stop a checkpoint.
+     * Recorded because it is worth knowing which process has them - the
+     * blocker is importing someone else's, not creating your own. */
     snprintf(detail, sizeof detail, "bytes=%zu", size);
-    record("cuMemCreate", "blocker", detail);
+    record("cuMemCreate", "conditional", detail);
     return real(h, size, prop, flags);
 }
 
@@ -237,7 +240,7 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
                   CUmemGenericAllocationHandle h, unsigned long long flags)
 {
     REAL("cuMemMap", fn_memmap);
-    record("cuMemMap", "blocker", "vmm mapping");
+    record("cuMemMap", "conditional", "vmm mapping");
     return real(ptr, size, offset, h, flags);
 }
 
@@ -249,9 +252,14 @@ CUresult cuMemExportToShareableHandle(void *out, CUmemGenericAllocationHandle h,
     REAL("cuMemExportToShareableHandle", fn_export);
     char detail[64];
     /* handle type 0x1 = POSIX fd, 0x8 = FABRIC in current headers. Recorded
-     * numerically so the report can name it without us guessing here. */
+     * numerically so the report can name it without us guessing here.
+     *
+     * Measured on 595: the exporting process checkpoints and restores fine
+     * even while a peer maps the memory. It is the importer that cannot be
+     * restored. So this is conditional, and the import below is the blocker.
+     * See docs/findings-595-blackwell.md. */
     snprintf(detail, sizeof detail, "handle_type=%d", handle_type);
-    record("cuMemExportToShareableHandle", "blocker", detail);
+    record("cuMemExportToShareableHandle", "conditional", detail);
     return real(out, h, handle_type, flags);
 }
 
@@ -261,6 +269,9 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
 {
     REAL("cuMemImportFromShareableHandle", fn_import);
     char detail[64];
+    /* The measured failure mode, and it is the worst kind: the checkpoint
+     * succeeds and the restore does not, past the point where anything can be
+     * undone. */
     snprintf(detail, sizeof detail, "handle_type=%d", handle_type);
     record("cuMemImportFromShareableHandle", "blocker", detail);
     return real(h, osh, handle_type);
