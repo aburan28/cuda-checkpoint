@@ -144,6 +144,11 @@ class Controller:
         while the previous one is still uploading is worse than a late one."""
         name = obj["metadata"]["name"]
         spec = obj.get("spec", {})
+        status = obj.get("status", {})
+
+        if status.get("suspended"):
+            return
+
         interval = float(spec.get("intervalSeconds", 3600))
         last = self._policy_last.get(name, 0)
         if time.time() - last < interval:
@@ -155,27 +160,50 @@ class Controller:
             result = self.coord.checkpoint(
                 job_id, mode="continue", reason=f"CheckpointPolicy/{name}"
             )
-            self._set_status(
-                "checkpointpolicies",
-                name,
-                {
-                    "lastEpochId": result["epoch_id"],
-                    "lastCheckpointAt": _now(),
-                    "consecutiveFailures": 0,
-                },
-            )
         except Exception as exc:
-            failures = obj.get("status", {}).get("consecutiveFailures", 0) + 1
-            self._set_status(
-                "checkpointpolicies",
-                name,
-                {
-                    "lastError": str(exc)[:500],
-                    "consecutiveFailures": failures,
-                    "lastAttemptAt": _now(),
-                },
-            )
-            _LOG.warn("policy checkpoint failed", name=name, failures=failures)
+            failures = status.get("consecutiveFailures", 0) + 1
+            limit = int(spec.get("suspendAfterFailures", 3))
+            update = {
+                "lastError": str(exc)[:500],
+                "consecutiveFailures": failures,
+                "lastAttemptAt": _now(),
+            }
+            if failures >= limit:
+                # Retrying a policy that has failed repeatedly turns one broken
+                # job into a source of load on every node it touches. Stop, and
+                # make the stop visible.
+                update["suspended"] = True
+                update["suspendedReason"] = (
+                    f"{failures} consecutive failures reached "
+                    f"suspendAfterFailures={limit}"
+                )
+                _LOG.error("policy suspended", name=name, failures=failures)
+            else:
+                _LOG.warn("policy checkpoint failed", name=name, failures=failures)
+            self._set_status("checkpointpolicies", name, update)
+            return
+
+        update = {
+            "lastEpochId": result["epoch_id"],
+            "lastCheckpointAt": _now(),
+            "consecutiveFailures": 0,
+        }
+        retain = int(spec.get("retain", 3))
+        try:
+            reclaimed = self.coord.gc(job_id, retain=retain)
+            update["retainedImages"] = len(reclaimed["kept"])
+            if reclaimed["deleted"]:
+                _LOG.info(
+                    "images reclaimed",
+                    name=name,
+                    deleted=len(reclaimed["deleted"]),
+                    retained=len(reclaimed["kept"]),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Retention failing must not mark a successful checkpoint failed.
+            update["lastError"] = f"gc: {str(exc)[:300]}"
+            _LOG.warn("gc failed", name=name, error=str(exc))
+        self._set_status("checkpointpolicies", name, update)
 
     # ------------------------------------------------------------- helpers
     def _set_status(self, plural, name, status):

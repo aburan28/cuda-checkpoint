@@ -128,6 +128,47 @@ class Coordinator:
         )
         return {"nodes": [n.get("host") for n in chosen], "rejected": rejected}
 
+    def gc(self, job_id, retain=3, image_root=None):
+        """Reclaim images beyond the retention count.
+
+        Two things are never deleted: the newest `retain` images, and whatever
+        the job's last-good pointer names. Deleting the image a failed epoch
+        would fall back to is the one mistake retention must not make.
+        """
+        retain = max(1, int(retain))
+        keep_epochs = self.store.retained(job_id)[:retain]
+        keep = {e["epoch_id"] for e in keep_epochs}
+        good = self.store.last_good(job_id)
+        if good and good.get("epoch_id"):
+            keep.add(good["epoch_id"])
+
+        candidates = [
+            e for e in self.store.retained(job_id) if e["epoch_id"] not in keep
+        ]
+        deleted = []
+        for epoch in candidates:
+            nodes = sorted({r["node"] for r in epoch.get("ranks", [])})
+            _results, errors = self.pool.fanout(
+                nodes,
+                "delete_images",
+                job_id=job_id,
+                epoch_id=epoch["epoch_id"],
+                image_root=image_root or self.cfg.image_dir,
+            )
+            if errors:
+                _LOG.warn(
+                    "image deletion incomplete",
+                    epoch=epoch["epoch_id"],
+                    errors=errors,
+                )
+            self.store.mark_pruned(epoch["epoch_id"])
+            deleted.append(epoch["epoch_id"])
+
+        _LOG.info(
+            "gc complete", job=job_id, retained=len(keep), deleted=len(deleted)
+        )
+        return {"kept": sorted(keep), "deleted": deleted}
+
     def status(self, job_id=None):
         return {
             "nodes": self.pool.nodes(),
@@ -161,6 +202,7 @@ def build_server(coord, addr=None):
         "checkpoint",
         "restore",
         "plan_restore",
+        "gc",
         "status",
         "recover",
     ):

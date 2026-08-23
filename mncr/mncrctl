@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""mncrctl - operator CLI.
+
+Everything an operator needs to do by hand, without writing Python. Talks to the
+coordinator over the same RPC the controller uses, so anything this can do the
+controller can do and vice versa.
+
+    mncrctl status [job]
+    mncrctl epochs <job>
+    mncrctl checkpoint <job> [--mode continue|stop] [--pre-dump]
+    mncrctl restore <job> <epoch> [--targets node-a=0,1 --targets node-b=2,3]
+    mncrctl plan-restore <epoch> --nodes 4
+    mncrctl gc <job> [--retain 3]
+    mncrctl agent <node> status
+    mncrctl preflight [--pid PID]
+"""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from mncr import config, rpc  # noqa: E402
+from mncr.proto import Phase  # noqa: E402
+
+
+def _client(addr):
+    return rpc.Client(addr, timeout=3600.0)
+
+
+def _print(payload, as_json):
+    print(json.dumps(payload, indent=2, default=str) if as_json else payload)
+
+
+def cmd_status(args, coord):
+    result = coord.call("status", job_id=args.job)
+    if args.json:
+        return result
+    lines = [f"nodes:  {', '.join(result['nodes']) or '(none)'}"]
+    lines.append("jobs:")
+    for job, ranks in sorted(result["jobs"].items()):
+        lines.append(f"  {job:<24} {ranks} ranks")
+    if not result["jobs"]:
+        lines.append("  (none registered)")
+    lines.append("recent epochs:")
+    for epoch in result["epochs"][-10:]:
+        seconds = epoch.get("seconds")
+        lines.append(
+            f"  {epoch['epoch_id']:<20} {epoch['job_id']:<16} "
+            f"{epoch['phase']:<14} {f'{seconds:.2f}s' if seconds else ''}"
+        )
+    if not result["epochs"]:
+        lines.append("  (none)")
+    return "\n".join(lines)
+
+
+def cmd_epochs(args, coord):
+    result = coord.call("status", job_id=args.job)
+    epochs = result["epochs"]
+    if args.json:
+        return epochs
+    if not epochs:
+        return f"no epochs for {args.job}"
+    lines = [f"{'EPOCH':<22}{'PHASE':<15}{'INTACT':<9}{'SECONDS':>8}"]
+    lines.append("-" * 54)
+    for epoch in epochs:
+        phase = epoch["phase"]
+        intact = "yes" if phase != Phase.FAILED.value else "NO"
+        seconds = epoch.get("seconds") or 0
+        lines.append(f"{epoch['epoch_id']:<22}{phase:<15}{intact:<9}{seconds:>8.2f}")
+    return "\n".join(lines)
+
+
+def cmd_checkpoint(args, coord):
+    result = coord.call(
+        "checkpoint",
+        job_id=args.job,
+        mode=args.mode,
+        pre_dump=args.pre_dump,
+        reason=args.reason or "mncrctl",
+    )
+    if args.json:
+        return result
+    return (
+        f"epoch {result['epoch_id']}\n"
+        f"phase {result['phase']}\n"
+        f"{result['images']} images in {result.get('seconds', 0):.2f}s"
+    )
+
+
+def cmd_restore(args, coord):
+    targets = None
+    if args.targets:
+        targets = {}
+        for spec in args.targets:
+            node, _, ranks = spec.partition("=")
+            if not ranks:
+                raise SystemExit(f"--targets wants node=rank,rank; got {spec!r}")
+            targets[node] = [int(r) for r in ranks.split(",") if r != ""]
+    result = coord.call(
+        "restore", job_id=args.job, epoch_id=args.epoch, targets=targets
+    )
+    if args.json:
+        return result
+    lines = [f"phase {result['phase']}"]
+    for node, cli in sorted(result.get("device_maps", {}).items()):
+        pairs = cli.split(",")
+        moved = sum(1 for p in pairs if p.split("=")[0] != p.split("=")[1])
+        lines.append(f"  {node:<18} {len(pairs)} GPUs mapped, {moved} moved")
+    return "\n".join(lines)
+
+
+def cmd_plan_restore(args, coord):
+    result = coord.call("plan_restore", epoch_id=args.epoch, node_count=args.nodes)
+    if args.json:
+        return result
+    lines = [f"eligible: {', '.join(result['nodes'])}"]
+    if result["rejected"]:
+        lines.append("rejected:")
+        for host, reasons in sorted(result["rejected"].items()):
+            lines.append(f"  {host}")
+            for reason in reasons:
+                lines.append(f"      {reason}")
+    return "\n".join(lines)
+
+
+def cmd_gc(args, coord):
+    result = coord.call("gc", job_id=args.job, retain=args.retain)
+    if args.json:
+        return result
+    return (
+        f"kept {len(result['kept'])}, deleted {len(result['deleted'])}\n"
+        + "\n".join(f"  deleted {e}" for e in result["deleted"])
+    )
+
+
+def cmd_agent(args, _coord):
+    with _client(args.addr) as client:
+        result = client.call("status")
+    if args.json:
+        return result
+    lines = [
+        f"node    {result['node']}",
+        f"driver  {result['driver']}",
+        f"criu    {result['criu']}",
+        f"fake    {result['fake']}",
+        "ranks:",
+    ]
+    for record in result["ranks"]:
+        lines.append(
+            f"  rank {record['rank']:<4} pid {record['host_pid']:<8} {record['job_id']}"
+        )
+    if not result["ranks"]:
+        lines.append("  (none registered)")
+    return "\n".join(lines)
+
+
+def cmd_preflight(args, _coord):
+    from agent import preflight
+
+    report = preflight.run(target_pid=args.pid)
+    if args.json:
+        return report
+    return preflight.render(report)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="mncrctl", description=__doc__.splitlines()[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--coord", default=None, help="coordinator address")
+    ap.add_argument("--json", action="store_true")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("status", help="cluster and job overview")
+    p.add_argument("job", nargs="?", default=None)
+    p.set_defaults(fn=cmd_status, needs_coord=True)
+
+    p = sub.add_parser("epochs", help="epoch history for a job")
+    p.add_argument("job")
+    p.set_defaults(fn=cmd_epochs, needs_coord=True)
+
+    p = sub.add_parser("checkpoint", help="take a checkpoint now")
+    p.add_argument("job")
+    p.add_argument("--mode", choices=("continue", "stop"), default="continue")
+    p.add_argument("--pre-dump", action="store_true",
+                   help="copy pages before the lock, shrinking the stop window")
+    p.add_argument("--reason", default=None)
+    p.set_defaults(fn=cmd_checkpoint, needs_coord=True)
+
+    p = sub.add_parser("restore", help="restore a job from an epoch")
+    p.add_argument("job")
+    p.add_argument("epoch")
+    p.add_argument("--targets", action="append", default=[],
+                   metavar="NODE=RANKS", help="repeatable, e.g. --targets node-a=0,1")
+    p.set_defaults(fn=cmd_restore, needs_coord=True)
+
+    p = sub.add_parser("plan-restore", help="which nodes could host an image")
+    p.add_argument("epoch")
+    p.add_argument("--nodes", type=int, required=True)
+    p.set_defaults(fn=cmd_plan_restore, needs_coord=True)
+
+    p = sub.add_parser("gc", help="reclaim images beyond the retention count")
+    p.add_argument("job")
+    p.add_argument("--retain", type=int, default=3)
+    p.set_defaults(fn=cmd_gc, needs_coord=True)
+
+    p = sub.add_parser("agent", help="query one node agent directly")
+    p.add_argument("addr", help="tcp:host:port")
+    p.add_argument("action", nargs="?", default="status", choices=("status",))
+    p.set_defaults(fn=cmd_agent, needs_coord=False)
+
+    p = sub.add_parser("preflight", help="validate this node against the real backends")
+    p.add_argument("--pid", type=int, default=None)
+    p.set_defaults(fn=cmd_preflight, needs_coord=False)
+
+    args = ap.parse_args(argv)
+    cfg = config.load()
+
+    coord = None
+    try:
+        if args.needs_coord:
+            addr = args.coord or cfg.coord_addr.replace("0.0.0.0", "127.0.0.1")
+            coord = _client(addr).connect()
+        _print(args.fn(args, coord), args.json)
+        return 0
+    except ConnectionError as exc:
+        print(f"cannot reach the coordinator: {exc}", file=sys.stderr)
+        return 2
+    except rpc.RemoteError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 1
+    finally:
+        if coord:
+            coord.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -8,18 +8,26 @@ PKGS     = mncr audit torchckpt agent coord imagestore k8s ncclx verify tests
 
 .PHONY: help
 help:
-	@echo "make check        compile every module and validate every manifest"
-	@echo "make test         unit and protocol tests (no GPU needed)"
-	@echo "make chaos        fault injection matrix"
-	@echo "make scale        scale ladder"
-	@echo "make verify       check + test + chaos"
-	@echo "make auditor      build the LD_PRELOAD allocation auditor (Linux)"
-	@echo "make p0           run the P0 audit against this host"
-	@echo "make clean"
+	@echo "no hardware needed"
+	@echo "  make check       compile every module and validate every manifest"
+	@echo "  make test        unit and protocol tests"
+	@echo "  make chaos       fault injection matrix"
+	@echo "  make scale       scale ladder"
+	@echo "  make verify      check + test + chaos"
+	@echo ""
+	@echo "on a GPU node"
+	@echo "  make preflight   can this node participate? (real backends)"
+	@echo "  make smoke       driver, criu, agent and a full epoch, for real"
+	@echo "  make p0          fleet audit and allocation report"
+	@echo "  make auditor     build the LD_PRELOAD allocation auditor"
+	@echo ""
+	@echo "packaging"
+	@echo "  make images      build the agent and control container images"
+	@echo "  make clean"
 
 .PHONY: check
 check:
-	@$(PY) -m compileall -q $(PKGS) && echo "compile: ok"
+	@$(PY) -m compileall -q $(PKGS) mncrctl && echo "compile: ok"
 	@$(PY) -c "import yaml, glob, sys; \
 	  files = sorted(glob.glob('k8s/crds/*.yaml') + glob.glob('k8s/manifests/*.yaml')); \
 	  n = sum(len([d for d in yaml.safe_load_all(open(f)) if d]) for f in files); \
@@ -42,6 +50,20 @@ scale:
 .PHONY: verify
 verify: check test chaos
 
+.PHONY: preflight
+preflight:
+	$(PY) -m agent.preflight
+
+.PHONY: smoke
+smoke:
+	$(PY) -m verify.smoke
+
+.PHONY: images
+images:
+	./prepare-image-context.sh
+	docker build --target control -t mncr-control:$(shell $(PY) -c "import mncr; print(mncr.__version__)") .
+	docker build --target agent   -t mncr-agent:$(shell $(PY) -c "import mncr; print(mncr.__version__)") .
+
 .PHONY: auditor
 auditor:
 	$(MAKE) -C audit/interpose
@@ -55,4 +77,5 @@ p0:
 .PHONY: clean
 clean:
 	find . -name '__pycache__' -type d -prune -exec rm -rf {} +
+	rm -rf vendor-bin
 	$(MAKE) -C audit/interpose clean

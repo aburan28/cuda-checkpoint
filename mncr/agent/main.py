@@ -17,6 +17,7 @@ Ops, in the order a checkpoint uses them:
 
 import argparse
 import os
+import shutil
 import threading
 import time
 
@@ -591,6 +592,39 @@ class Agent:
             _LOG.info("reaped dead ranks", node=self.node, count=len(dead))
         return {"node": self.node, "reaped": [k[1] for k in dead]}
 
+    # ------------------------------------------------------------- retention
+    def delete_images(self, job_id, epoch_id, image_root):
+        """Remove this node's images for an epoch, shards included.
+
+        Best effort by design: retention that stops at the first error leaves
+        the disk full, which is the problem it exists to prevent.
+        """
+        directory = os.path.join(image_root, epoch_id)
+        shards = {"removed": 0, "failed": []}
+        manifest_path = self._manifest_path(image_root, epoch_id)
+        if os.path.exists(manifest_path):
+            try:
+                shards = self.pipeline.delete_epoch(Manifest.load(manifest_path))
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warn("shard deletion failed", epoch=epoch_id, error=str(exc))
+        removed_dir = False
+        try:
+            shutil.rmtree(directory)
+            removed_dir = True
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _LOG.warn("image directory not removed", path=directory, error=str(exc))
+        _LOG.info(
+            "images deleted",
+            job=job_id,
+            epoch=epoch_id,
+            node=self.node,
+            shards=shards["removed"],
+            directory=removed_dir,
+        )
+        return {"node": self.node, "shards": shards["removed"], "directory": removed_dir}
+
     # ------------------------------------------------------------- job files
     def job_create(self, job_id):
         return {"path": self.jobfiles.create(job_id)}
@@ -616,6 +650,7 @@ def build_server(agent, addr=None):
         "abort",
         "forget",
         "reap",
+        "delete_images",
         "status",
         "job_create",
         "job_env",

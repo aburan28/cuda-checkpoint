@@ -27,12 +27,16 @@ FAKE_RANK = os.path.join(HERE, "fake", "fake_rank.py")
 
 class SimCluster:
     def __init__(self, nodes=2, ranks_per_node=2, job_id="sim-job", step_seconds=0.005,
-                 call_latency=0.0):
+                 call_latency=0.0, real=False):
         self.nodes = nodes
         self.ranks_per_node = ranks_per_node
         self.job_id = job_id
         self.step_seconds = step_seconds
         self.call_latency = call_latency
+        # real=True swaps in the CLI driver and CRIU backends. Same protocol,
+        # same code path, actual hardware underneath - this is what turns the
+        # simulator into the on-node integration test.
+        self.real = real
         self.root = tempfile.mkdtemp(prefix="mncr-sim-")
         self.control_root = os.path.join(self.root, "control")
         self.image_root = os.path.join(self.root, "images")
@@ -46,7 +50,7 @@ class SimCluster:
     # ------------------------------------------------------------------ setup
     def start(self):
         cfg = config.Config()
-        cfg.fake = True
+        cfg.fake = not self.real
         cfg.image_dir = self.image_root
         cfg.cache_dir = os.path.join(self.root, 'cache')
         cfg.quiesce_timeout = 30.0
@@ -89,8 +93,9 @@ class SimCluster:
         )
         return self
 
-    def launch_ranks(self, dirty_ranks=()):
+    def launch_ranks(self, dirty_ranks=(), cuda=None):
         dirty = set(dirty_ranks)
+        cuda = self.real if cuda is None else cuda
         world = self.nodes * self.ranks_per_node
         rank_id = 0
         for index in range(self.nodes):
@@ -108,10 +113,12 @@ class SimCluster:
                     "--control-root", node_control,
                     "--progress", progress,
                     "--step-seconds", str(self.step_seconds),
-                    "--proc-root", os.path.join(self.root, "no-proc"),
+                    "--proc-root", "/proc" if self.real else os.path.join(self.root, "no-proc"),
                 ]
                 if rank_id in dirty:
                     cmd.append("--dirty")
+                if cuda:
+                    cmd.append("--cuda")
                 env = dict(os.environ, MNCR_LOG_LEVEL="warn", PYTHONPATH=_repo_root())
                 self.procs.append(
                     (rank_id, node, subprocess.Popen(cmd, env=env,

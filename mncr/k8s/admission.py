@@ -57,15 +57,38 @@ def review(request, node_lookup=None, min_driver=MIN_DRIVER, allow_mnnvl=False):
         )
 
     if node_name and node_lookup:
-        node = node_lookup(node_name) or {}
-        node_labels = (node.get("metadata", {}) or {}).get("labels", {}) or {}
+        node = node_lookup(node_name)
+        node_labels = ((node or {}).get("metadata", {}) or {}).get("labels", {}) or {}
+
+        # Knowing nothing about a node is not the same as knowing it is bad. If
+        # the lookup came back empty - an API outage, a node that has not
+        # registered yet - allow and say the check was not made. Denying here
+        # would turn an API blip into a cluster-wide scheduling stop, and the
+        # nodeSelector plus the agent's own preflight already keep a pod off a
+        # node that cannot checkpoint.
+        if not node_labels:
+            return _allow(
+                uid,
+                f"node {node_name} could not be evaluated; allowing on the "
+                f"nodeSelector and the agent preflight",
+            )
+
         if not allow_mnnvl and node_labels.get(LABEL_MNNVL, "false").lower() == "true":
             return _deny(
                 uid,
                 f"node {node_name} exposes MNNVL/fabric state; fabric handles "
                 f"cannot be checkpointed",
             )
-        major = _driver_major(node_labels.get(LABEL_DRIVER, "0"))
+        # A node labelled checkpointable but missing its driver label is a
+        # labelling error, and that one is worth catching: it means something
+        # produced a half-configured node.
+        if LABEL_DRIVER not in node_labels:
+            return _deny(
+                uid,
+                f"node {node_name} is labelled checkpointable but has no "
+                f"{LABEL_DRIVER} label; it is only half configured",
+            )
+        major = _driver_major(node_labels[LABEL_DRIVER])
         if major < min_driver:
             return _deny(
                 uid,

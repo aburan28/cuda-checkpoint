@@ -19,6 +19,12 @@
 | P5 | pre-dump pass | `agent/main.py`, `coord/epoch.py` | runs before the lock; failure is non-fatal |
 | P5 | tiered storage + cache | `imagestore/backends.py`, `cache.py` | eviction policy tested |
 | P6 | CRDs, controller, admission | `k8s/` | manifests validate; admission unit tested |
+| P6 | admission webhook server | `k8s/admission_server.py` | fail-open on API outage, node cache, health probes |
+| P6 | retention and policy suspension | `k8s/controller.py`, `coord/main.py` | last-good never deleted; suspend after N failures |
+| P6 | container images, CI | `Dockerfile`, `.github/workflows/verify.yml` | two targets, stdlib only; CI runs the whole suite |
+| — | operator CLI | `mncrctl` | exercised against a live coordinator |
+| — | node preflight | `agent/preflight.py` | real backends; runs as a DaemonSet init container |
+| — | on-node smoke test | `verify/smoke.py`, `verify/smoke_target.cu` | four levels; skips cleanly without hardware |
 | P7 | NCCL seam + benchmark | `ncclx/` | seam refuses the unsafe fast path; patch specified |
 | P8 | simulator, chaos, scale | `verify/` | all green |
 
@@ -28,5 +34,7 @@
   `ncclx/README.md` specifies it.
 * A mutating webhook to inject the job-file env var. `k8s/admission.py` has the
   helper; the validating path is what is wired.
+* TLS certificate issuance for the webhook. The Deployment mounts
+  `mncr-admission-tls`; producing it is left to cert-manager or your own CA.
 * Object-store credentials handling. `RemoteBackend` shells to whatever CLI the
   cluster already trusts.

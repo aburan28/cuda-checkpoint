@@ -16,7 +16,7 @@ spec:
       serviceAccountName: mncr-coordinator
       containers:
         - name: coordinator
-          image: ghcr.io/example/mncr-coordinator:0.1.0
+          image: ghcr.io/example/mncr-control:0.1.0
           command: [python3, -m, k8s.controller]
           args: ["--interval", "5"]
           env:

@@ -22,6 +22,30 @@ spec:
         mncr.io/checkpointable: "true"
       tolerations:
         - operator: Exists
+      # A node that cannot participate must not advertise itself as one that
+      # can. Preflight uses the real backends and fails the pod if the node is
+      # not usable, so the failure surfaces at rollout rather than at the
+      # commit point of somebody's job.
+      initContainers:
+        - name: preflight
+          image: ghcr.io/example/mncr-agent:0.1.0
+          command: [python3, -m, agent.preflight]
+          securityContext:
+            privileged: true
+          env:
+            - name: NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: MNCR_CONTROL_ROOT
+              value: /run/mncr
+            - name: MNCR_IMAGE_DIR
+              value: /var/lib/mncr/images
+            - name: MNCR_CACHE_DIR
+              value: /var/lib/mncr/cache
+          volumeMounts:
+            - {name: control, mountPath: /run/mncr}
+            - {name: images, mountPath: /var/lib/mncr}
+            - {name: dev, mountPath: /dev}
+            - {name: criu-lib, mountPath: /usr/lib/criu, readOnly: true}
       containers:
         - name: agent
           image: ghcr.io/example/mncr-agent:0.1.0
@@ -39,6 +63,8 @@ spec:
               value: /run/mncr
             - name: MNCR_IMAGE_DIR
               value: /var/lib/mncr/images
+            - name: MNCR_CACHE_DIR
+              value: /var/lib/mncr/cache
             - name: MNCR_LOCK_TIMEOUT_MS
               value: "60000"
           ports:

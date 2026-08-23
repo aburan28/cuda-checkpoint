@@ -30,9 +30,17 @@ def main():
     ap.add_argument("--step-seconds", type=float, default=0.01)
     ap.add_argument("--proc-root", default="/proc")
     ap.add_argument("--dirty", action="store_true", help="fail the clean check")
+    ap.add_argument(
+        "--cuda",
+        action="store_true",
+        help="hold real device memory and verify it after every resume; "
+             "required when running against the real driver, which will not "
+             "checkpoint a process that has no CUDA state",
+    )
     args = ap.parse_args()
 
     events = []
+    device_state = {}
 
     def record(name, **fields):
         events.append({"at": time.time(), "event": name, **fields})
@@ -47,6 +55,17 @@ def main():
                 },
                 fh,
             )
+
+    if args.cuda:
+        import torch
+
+        if not torch.cuda.is_available():
+            raise SystemExit("--cuda requested but no CUDA device is available")
+        device_state["expected"] = torch.arange(
+            1 << 20, dtype=torch.int64, device="cuda"
+        )
+        device_state["buffer"] = device_state["expected"].clone()
+        torch.cuda.synchronize()
 
     torchckpt.init(
         job_id=args.job_id,
@@ -68,12 +87,21 @@ def main():
 
     @torchckpt.on_resume
     def rebuild(ctx):
+        intact = None
+        if device_state:
+            import torch
+
+            intact = bool(
+                (device_state["buffer"] == device_state["expected"]).all().item()
+            )
+            torch.cuda.synchronize()
         record(
             "resumed",
             epoch=ctx.epoch_id,
             restored=ctx.restored,
             aborted=ctx.aborted,
             world_size=ctx.world_size,
+            device_memory_intact=intact,
         )
 
     torchckpt.graphs.register("decode-graph", lambda: record("graph_recaptured"))
