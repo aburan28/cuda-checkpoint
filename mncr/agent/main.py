@@ -387,7 +387,7 @@ class Agent:
 
     # --------------------------------------------------------------- restore
     def restore(self, job_id, epoch_id, image_root, ranks=None, device_map=None,
-                init_method=None, from_images=True, world_size=None):
+                init_method=None, from_images=True, world_size=None, backend=None):
         """Restore, unlock, and release the ranks - in checkpoint order.
 
         The vendor's r610 demo is explicit that processes must be restored and
@@ -420,13 +420,14 @@ class Agent:
             init_method=init_method,
             device_map=device_map,
             world_size=world_size,
+            backend=backend,
         )
         _LOG.info("restored", job=job_id, epoch=epoch_id, count=len(restored))
         return {"node": self.node, "restored": restored}
 
     # ----------------------------------------------------------------- abort
     def abort(self, job_id, epoch_id, ranks=None, reason="aborted",
-              init_method=None, world_size=None):
+              init_method=None, world_size=None, backend=None):
         """Undo an epoch that has not crossed the commit point."""
         with self._lock:
             locked = list(self._locked.pop((job_id, epoch_id), []))
@@ -452,6 +453,7 @@ class Agent:
             init_method=init_method,
             device_map=None,
             world_size=world_size,
+            backend=backend,
             reason=reason,
         )
         _LOG.info("aborted", job=job_id, epoch=epoch_id, unlocked=len(locked))
@@ -559,7 +561,7 @@ class Agent:
         return record
 
     def _release(self, job_id, epoch_id, ranks, restored, aborted, init_method,
-                 device_map, world_size, reason=None):
+                 device_map, world_size, backend=None, reason=None):
         """Write the token each rank is polling for.
 
         An aborted epoch still needs the rank to rebuild: the teardown already
@@ -576,6 +578,7 @@ class Agent:
                     "restored": bool(restored),
                     "aborted": bool(aborted),
                     "init_method": init_method,
+                    "backend": backend or "nccl",
                     "device_map": device_map or {},
                     "reason": reason,
                     "at": time.time(),

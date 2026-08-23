@@ -2,16 +2,16 @@
 
 | Phase | Deliverable | Where | Exit criterion status |
 |---|---|---|---|
-| P0 | allocation auditor | `audit/interpose/cuda_audit.c` | compiles; needs a GPU node to run |
+| P0 | allocation auditor | `audit/interpose/cuda_audit.c` | logic tested against a stand-in driver, including the cuGetProcAddress redirect; unproven against real CUDA |
 | P0 | fleet audit + report | `audit/fleet_audit.sh`, `audit/report.py` | runs; produces a go/no-go verdict |
 | P0 | expandable-segments experiment | `audit/experiments/expandable_segments.py` | runs; skips cleanly without CUDA |
-| P1 | rank library | `torchckpt/` | full lifecycle exercised in the simulator |
+| P1 | rank library | `torchckpt/` | full lifecycle in the simulator; step agreement and rebuild proven with real gloo collectives |
 | P1 | clean-room assertion | `torchckpt/cleanroom.py`, `mncr/procscan.py` | unit tested against fixture procfs |
 | P2 | node agent | `agent/main.py` | drives the full sequence in the simulator |
 | P2 | driver + CRIU backends | `agent/driver.py`, `agent/criu.py` | fakes tested; CLI paths unproven |
 | P2 | job files, pid translation | `agent/jobfile.py`, `agent/pids.py` | single-use rule unit tested |
 | P3 | two-phase commit | `coord/epoch.py` | eight injected faults, both invariants hold |
-| P3 | epoch store | `coord/store.py` | recovery classification tested |
+| P3 | epoch store | `coord/store.py` | restart classification tested on both sides of the commit point |
 | P4 | device maps | `coord/devicemap.py` | partial maps rejected; cross-node restore tested |
 | P4 | placement admission | `coord/placement.py` | every rejection reason unit tested |
 | P5 | image pipeline | `imagestore/pipeline.py` | byte-identical round trip, corruption detected |

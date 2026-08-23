@@ -31,6 +31,14 @@ def main():
     ap.add_argument("--proc-root", default="/proc")
     ap.add_argument("--dirty", action="store_true", help="fail the clean check")
     ap.add_argument(
+        "--gloo",
+        action="store_true",
+        help="join a real gloo process group and run a collective every step, "
+             "so step agreement and communicator rebuild are exercised for "
+             "real rather than falling through the no-process-group path",
+    )
+    ap.add_argument("--init-method", default=None, help="rendezvous for --gloo")
+    ap.add_argument(
         "--cuda",
         action="store_true",
         help="hold real device memory and verify it after every resume; "
@@ -41,6 +49,7 @@ def main():
 
     events = []
     device_state = {}
+    collective = {}
 
     def record(name, **fields):
         events.append({"at": time.time(), "event": name, **fields})
@@ -55,6 +64,19 @@ def main():
                 },
                 fh,
             )
+
+    if args.gloo:
+        import torch
+        import torch.distributed as dist
+
+        dist.init_process_group(
+            "gloo",
+            init_method=args.init_method,
+            rank=args.rank,
+            world_size=args.world_size,
+        )
+        collective["torch"] = torch
+        collective["dist"] = dist
 
     if args.cuda:
         import torch
@@ -83,7 +105,9 @@ def main():
     def teardown():
         if args.dirty:
             raise RuntimeError("simulated teardown failure: communicator still live")
-        record("quiesced")
+        # The step at which this rank stopped. Every rank must report the same
+        # one, or the restored job has ranks on different steps.
+        record("quiesced", step=torchckpt.status()["step"])
 
     @torchckpt.on_resume
     def rebuild(ctx):
@@ -95,8 +119,18 @@ def main():
                 (device_state["buffer"] == device_state["expected"]).all().item()
             )
             torch.cuda.synchronize()
+        rejoined = None
+        if collective:
+            dist = collective["dist"]
+            torch = collective["torch"]
+            if dist.is_initialized():
+                probe = torch.ones(4) * (args.rank + 1)
+                dist.all_reduce(probe)
+                expected = args.world_size * (args.world_size + 1) / 2
+                rejoined = bool(torch.allclose(probe, torch.full((4,), expected)))
         record(
             "resumed",
+            rejoined=rejoined,
             epoch=ctx.epoch_id,
             restored=ctx.restored,
             aborted=ctx.aborted,
@@ -108,6 +142,12 @@ def main():
 
     for _ in range(args.steps):
         with torchckpt.safe_point():
+            if collective:
+                dist = collective["dist"]
+                torch = collective["torch"]
+                # A collective every step is what couples the ranks: a rank that
+                # stops issuing them blocks every peer at the next one.
+                dist.all_reduce(torch.ones(4))
             time.sleep(args.step_seconds)
         if torchckpt.status()["step"] % 25 == 0:
             record("step")

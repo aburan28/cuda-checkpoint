@@ -23,6 +23,10 @@ class EpochRunner:
         self.store = store
         self.cfg = cfg
         self.node_info = node_info or {}
+        # Recorded so an abort - which happens outside checkpoint()'s argument
+        # list - releases ranks with the same collective backend they were
+        # torn down from.
+        self.default_backend = "nccl"
 
     # ------------------------------------------------------------- utilities
     def _save(self, epoch, phase=None, note=None, error=None):
@@ -55,6 +59,7 @@ class EpochRunner:
             epoch_id=epoch["epoch_id"],
             reason=reason,
             init_method=init_method,
+            backend=self.default_backend,
             world_size=len(epoch["ranks"]),
         )
         # Whether every rank was released. The epoch is still aborted rather
@@ -94,7 +99,8 @@ class EpochRunner:
 
     # -------------------------------------------------------------- the flow
     def checkpoint(self, job_id, ranks, mode="continue", image_root=None,
-                   init_method=None, reason="manual", pre_dump=False):
+                   init_method=None, reason="manual", pre_dump=False,
+                   backend="nccl"):
         """Run one checkpoint epoch.
 
         mode="continue"  checkpoint and keep the job running (fault tolerance)
@@ -102,6 +108,7 @@ class EpochRunner:
         pre_dump=True    copy pages before the lock, shrinking the stop window
         """
         image_root = image_root or self.cfg.image_dir
+        self.default_backend = backend
         epoch = Epoch.make(job_id, ranks, reason=reason)
         self.store.put(epoch)
         started = time.time()
@@ -243,6 +250,7 @@ class EpochRunner:
                 image_root=image_root,
                 from_images=False,   # the processes never died
                 init_method=init_method,
+                backend=backend,
                 world_size=len(epoch["ranks"]),
                 _timeout=self.cfg.checkpoint_timeout,
             )
@@ -272,7 +280,7 @@ class EpochRunner:
 
     # ----------------------------------------------------------- restore
     def restore(self, job_id, epoch_id, ranks, image_root=None, device_maps=None,
-                init_method=None):
+                init_method=None, backend="nccl"):
         """Bring a dumped job back, possibly onto different nodes.
 
         device_maps is {node: "old=new,..."} because each node's target UUIDs
@@ -303,6 +311,7 @@ class EpochRunner:
             image_root=image_root,
             from_images=True,
             init_method=init_method,
+            backend=backend,
             world_size=len(epoch["ranks"]),
             _timeout=self.cfg.dump_timeout,
         )

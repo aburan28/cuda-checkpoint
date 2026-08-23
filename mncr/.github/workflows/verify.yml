@@ -45,9 +45,9 @@ jobs:
         env:
           MNCR_LOG_LEVEL: error
 
-      - name: Build the allocation auditor
+      - name: Allocation auditor, via the real LD_PRELOAD path
         working-directory: mncr/audit/interpose
-        run: make
+        run: make test
 
       - name: Smoke levels degrade cleanly without hardware
         working-directory: mncr
@@ -61,6 +61,27 @@ jobs:
               print(f"{entry['level']} {entry['name']}: {entry['status']}")
           sys.exit(1 if bad else 0)
           PY
+
+  collectives:
+    # The consistent-cut mechanism only means anything against a real process
+    # group. gloo on CPU gives us one without a GPU, so this is the job that
+    # proves ranks agree on a step and that a torn-down group comes back.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install torch (CPU only)
+        run: |
+          python3 -m pip install --quiet \
+            --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Step agreement and communicator rebuild
+        working-directory: mncr
+        run: python3 -m unittest tests.test_collectives -v
+        env:
+          MNCR_LOG_LEVEL: error
 
   images:
     runs-on: ubuntu-latest

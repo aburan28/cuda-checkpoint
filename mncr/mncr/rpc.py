@@ -174,7 +174,15 @@ class Client:
         family, target = parse_addr(self.addr)
         sock = socket.socket(family, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
-        sock.connect(target)
+        try:
+            sock.connect(target)
+        except BaseException:
+            # A refused connection is routine here - an agent restarting, a
+            # coordinator that has not come up yet - and the caller's `with`
+            # block never runs its exit, so the socket has to be closed on the
+            # way out or it leaks on every retry.
+            sock.close()
+            raise
         self._sock = sock
         self._rfile = sock.makefile("rb")
         return self

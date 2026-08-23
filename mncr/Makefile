@@ -14,6 +14,7 @@ help:
 	@echo "  make chaos       fault injection matrix"
 	@echo "  make scale       scale ladder"
 	@echo "  make verify      check + test + chaos"
+	@echo "  make interposer  build and test the allocation auditor"
 	@echo ""
 	@echo "on a GPU node"
 	@echo "  make preflight   can this node participate? (real backends)"
@@ -32,7 +33,7 @@ check:
 	  files = sorted(glob.glob('k8s/crds/*.yaml') + glob.glob('k8s/manifests/*.yaml')); \
 	  n = sum(len([d for d in yaml.safe_load_all(open(f)) if d]) for f in files); \
 	  print(f'manifests: ok ({n} documents in {len(files)} files)')"
-	@$(MAKE) -s -C audit/interpose check && echo "interposer: ok"
+	@$(MAKE) -s -C audit/interpose test
 	@shellcheck audit/fleet_audit.sh && echo "shell: ok"
 
 .PHONY: test
@@ -64,9 +65,15 @@ images:
 	docker build --target control -t mncr-control:$(shell $(PY) -c "import mncr; print(mncr.__version__)") .
 	docker build --target agent   -t mncr-agent:$(shell $(PY) -c "import mncr; print(mncr.__version__)") .
 
-.PHONY: auditor
+.PHONY: auditor interposer
 auditor:
 	$(MAKE) -C audit/interpose
+
+# Builds the interposer and runs it against a stand-in driver. On Linux that is
+# the production LD_PRELOAD path; on macOS it links directly, which covers the
+# logic but not the preload mechanism.
+interposer:
+	$(MAKE) -C audit/interpose test
 
 .PHONY: p0
 p0:

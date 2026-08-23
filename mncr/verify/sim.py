@@ -37,6 +37,7 @@ class SimCluster:
         # same code path, actual hardware underneath - this is what turns the
         # simulator into the on-node integration test.
         self.real = real
+        self.gloo = False
         self.root = tempfile.mkdtemp(prefix="mncr-sim-")
         self.control_root = os.path.join(self.root, "control")
         self.image_root = os.path.join(self.root, "images")
@@ -93,9 +94,11 @@ class SimCluster:
         )
         return self
 
-    def launch_ranks(self, dirty_ranks=(), cuda=None):
+    def launch_ranks(self, dirty_ranks=(), cuda=None, gloo=False):
         dirty = set(dirty_ranks)
         cuda = self.real if cuda is None else cuda
+        self.gloo = gloo
+        init_method = self.new_rendezvous() if gloo else None
         world = self.nodes * self.ranks_per_node
         rank_id = 0
         for index in range(self.nodes):
@@ -119,6 +122,8 @@ class SimCluster:
                     cmd.append("--dirty")
                 if cuda:
                     cmd.append("--cuda")
+                if gloo:
+                    cmd += ["--gloo", "--init-method", init_method]
                 env = dict(os.environ, MNCR_LOG_LEVEL="warn", PYTHONPATH=_repo_root())
                 self.procs.append(
                     (rank_id, node, subprocess.Popen(cmd, env=env,
@@ -151,6 +156,21 @@ class SimCluster:
         return sorted(refs, key=lambda r: r["rank"])
 
     # ------------------------------------------------------------ inspection
+    def new_rendezvous(self):
+        """A fresh rendezvous address.
+
+        Fresh per epoch on purpose: after a restore the peers are at different
+        addresses, so reusing the old one would test nothing and would collide
+        with the store the destroyed group left behind.
+        """
+        import socket
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        return f"tcp://127.0.0.1:{port}"
+
     def progress(self, rank):
         path = os.path.join(self.root, f"rank-{rank}.json")
         try:

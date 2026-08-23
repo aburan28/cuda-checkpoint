@@ -50,7 +50,7 @@ class Coordinator:
         return self._jobs[job_id]
 
     def checkpoint(self, job_id, mode="continue", image_root=None, init_method=None,
-                   reason="manual", pre_dump=False):
+                   reason="manual", pre_dump=False, backend="nccl"):
         epoch = self.runner.checkpoint(
             job_id,
             self.job_ranks(job_id),
@@ -59,11 +59,13 @@ class Coordinator:
             init_method=init_method,
             reason=reason,
             pre_dump=pre_dump,
+            backend=backend,
         )
         return {"epoch_id": epoch["epoch_id"], "phase": epoch["phase"],
                 "images": len(epoch.get("images", [])), "seconds": epoch.get("seconds")}
 
-    def restore(self, job_id, epoch_id, targets=None, image_root=None, init_method=None):
+    def restore(self, job_id, epoch_id, targets=None, image_root=None,
+                init_method=None, backend="nccl"):
         """Restore onto `targets` ({node: [ranks]}), defaulting to where it ran."""
         source = self.store.get(epoch_id)
         if source is None:
@@ -85,7 +87,7 @@ class Coordinator:
 
         epoch = self.runner.restore(
             job_id, epoch_id, ranks, image_root=image_root,
-            device_maps=device_maps, init_method=init_method,
+            device_maps=device_maps, init_method=init_method, backend=backend,
         )
         self._jobs[job_id] = ranks
         return {"epoch_id": epoch_id, "phase": epoch["phase"],
