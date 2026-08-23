@@ -279,5 +279,45 @@ These limitations will be addressed in subsequent display driver releases,
 and will not require an update to the `cuda-checkpoint` utility itself.
 The `cuda-checkpoint` utility simply exposes functionality that is contained in the driver.
 
+### GDS and RDMA transport development
+
+The current driver-managed checkpoint path stages device allocations in host memory.
+This repository does not yet ship a `cuda-checkpoint` option that writes or restores those allocations through
+GPUDirect Storage (GDS), an RDMA-backed filesystem, or another external transport.
+
+An [external transport design proposal](docs/gds-rdma-transport-design.md) specifies a backward-compatible,
+file-descriptor-based CUDA Driver API, direct-path and fallback semantics, image commit rules,
+failure recovery, an internal backend interface, and the required validation matrix.
+
+The repository also includes a standalone [transport benchmark](src/gds-transport-benchmark.cu).
+It compares the data movement performed by today's checkpoint-shaped host-staged path with direct `cuFileRead`
+and `cuFileWrite` operations. It does **not** modify or benchmark the internal `cuda-checkpoint` implementation;
+an end-to-end implementation still requires the display-driver changes described in the design proposal.
+
+Build the benchmark on a Linux system with the CUDA Toolkit and GPUDirect Storage development files installed:
+
+```bash
+make -C src gds-transport-benchmark
+```
+
+Run it on a GDS-capable mount. The size must be a multiple of 4096 bytes:
+
+```bash
+src/gds-transport-benchmark \
+    --directory /mnt/gds \
+    --bytes 8G \
+    --iterations 5 \
+    > transport-results.csv
+```
+
+The default checkpoint measurement includes `fdatasync`, so it represents time to durable completion rather than
+only submission time. Use `--no-sync` to measure transfer completion without the durability flush,
+or `--mode staged` to collect the host-staged baseline when the selected filesystem is not GDS capable.
+Generated files have unique process-specific names, use `O_DIRECT`, and are removed after a successful or failed run
+unless `--keep-files` is specified.
+
+Before interpreting a successful cuFile run as a direct-path result, disable cuFile compatibility mode and verify the
+platform with `gdscheck -p`. Compatibility mode may make the cuFile API succeed while internally using host staging.
+
 ## License
 By downloading or using the software, you agree to the terms of the [License Agreement for NVIDIA Software Development Kits — EULA](https://docs.nvidia.com/cuda/eula/index.html).
