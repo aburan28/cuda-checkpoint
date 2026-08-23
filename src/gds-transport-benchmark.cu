@@ -58,10 +58,25 @@ void checkCuda(cudaError_t status, const char *operation)
     }
 }
 
+std::string cuFileStatusError(CUfileError_t status)
+{
+    std::string message(CUFILE_ERRSTR(status.err));
+    if (IS_CUDA_ERR(status)) {
+        const char *cudaError = nullptr;
+        const CUresult lookup =
+            cuGetErrorString(CU_FILE_CUDA_ERR(status), &cudaError);
+        if (lookup == CUDA_SUCCESS && cudaError != nullptr) {
+            message += ": ";
+            message += cudaError;
+        }
+    }
+    return message;
+}
+
 void checkCuFile(CUfileError_t status, const char *operation)
 {
     if (status.err != CU_FILE_SUCCESS) {
-        fail(std::string(operation) + ": " + cuFileGetErrorString(status));
+        fail(std::string(operation) + ": " + cuFileStatusError(status));
     }
 }
 
@@ -373,7 +388,7 @@ class CuFileDriver {
             CUfileError_t status = cuFileDriverClose();
             if (status.err != CU_FILE_SUCCESS) {
                 std::fprintf(stderr, "warning: cuFileDriverClose: %s\n",
-                             cuFileGetErrorString(status));
+                             cuFileStatusError(status).c_str());
             }
         }
     }
@@ -400,7 +415,7 @@ class CuFileBuffer {
             CUfileError_t status = cuFileBufDeregister(pointer_);
             if (status.err != CU_FILE_SUCCESS) {
                 std::fprintf(stderr, "warning: cuFileBufDeregister: %s\n",
-                             cuFileGetErrorString(status));
+                             cuFileStatusError(status).c_str());
             }
         }
     }
@@ -481,7 +496,10 @@ void readAll(int fd, void *buffer, size_t bytes)
 std::string cuFileIoError(ssize_t result)
 {
     if (IS_CUFILE_ERR(result)) {
-        return cuFileGetErrorString(result);
+        return CUFILE_ERRSTR(result);
+    }
+    if (result == 0) {
+        return "unexpected zero-byte I/O";
     }
     return std::strerror(errno);
 }
