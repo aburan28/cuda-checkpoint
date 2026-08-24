@@ -63,9 +63,12 @@ otherwise only testable on hardware:
 
 - **The interposer runs against a stand-in driver.** `make check` builds
   `cuda_audit.so`, loads it over a fake libcuda and asserts what it recorded —
-  including that a call resolved through `cuGetProcAddress` went through the
-  wrapper. Interposing the symbol alone would pass a naive test and silently
-  miss every allocation NCCL makes.
+  including that calls resolved through `cuGetProcAddress` and through
+  `dlsym` on a handle both went through the wrapper. Interposing the symbol
+  alone would pass a naive test and miss how frameworks actually reach libcuda.
+  Note the measured caveat: it does **not** see PyTorch's own allocations, so an
+  empty report is not proof of a clean workload —
+  [findings](docs/findings-595-blackwell.md).
 - **Step agreement runs against a real process group.** gloo on CPU gives real
   collectives without a GPU, so `tests/test_collectives.py` proves ranks
   arriving at different local steps all stop at the same one, and that a torn

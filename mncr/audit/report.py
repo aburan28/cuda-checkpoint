@@ -270,6 +270,13 @@ def render(report):
     add("OBSERVED ALLOCATIONS")
     if not report["api_findings"]:
         add("  (no interposer output supplied)")
+        add("")
+        add("  NOTE: an empty result is not the same as a clean workload.")
+        add("  Measured on torch 2.13+cu130: PyTorch's own allocations are not")
+        add("  visible to the interposer, including expandable segments that")
+        add("  demonstrably engaged. For a PyTorch workload, trust the driver's")
+        add("  verdict - checkpoint a canary - over an empty audit.")
+        add("  See docs/findings-595-blackwell.md.")
     for f in report["api_findings"]:
         add(f"  [{f['verdict']:^11}] {f['api']}  x{f['calls']}")
         if f["detail"]:

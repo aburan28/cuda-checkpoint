@@ -179,6 +179,41 @@ checkpoint the driver has closed every GPU fd, so their presence then really
 does mean the checkpoint did not do what we think. Detecting actual managed
 memory *use* is what the P0 interposer is for; /proc cannot tell you.
 
+## The auditor does not see PyTorch, and that is a caveat on P0
+
+Measured in a container built from the vLLM image (torch 2.13.0+cu130, CUDA 13,
+NCCL 2.29.7) on the same node.
+
+What the interposer **does** catch, all three proven under real `LD_PRELOAD`:
+
+| Resolution path | Caught |
+|---|---|
+| direct PLT call from a linked program | yes |
+| `cuGetProcAddress` | yes |
+| `dlopen` + `dlsym` on the libcuda handle | yes, once hooked |
+
+The `dlsym` hook was added because of this work: PyTorch and NCCL do not link
+libcuda, they dlopen it and dlsym their way in, and symbol interposition alone
+never sees that. A C probe proves the hook works.
+
+What it does **not** catch: PyTorch's own allocations. With
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, torch reserved 2,060 MiB
+with `segment.all.current = 0` - expandable segments demonstrably engaged - and
+the auditor recorded nothing at all. Not `cuMemCreate`, not `cuMemMap`, and not
+`cuMemAddressReserve`, which no VMM allocation can skip. The same hooks, in the
+same container, record all three from a C program.
+
+The mechanism was not established by black-box probing and is not guessed at
+here.
+
+**The consequence is what matters: an empty audit report for a PyTorch workload
+is not evidence that the workload is clean on this stack.** Do not treat it as
+one. Until the gap is understood, the trustworthy signal is the driver's own
+verdict - run the allocation the workload uses in a canary and try to checkpoint
+it, which is exactly what `verify/vmm_probe.cu` does. The interposer remains
+useful for non-PyTorch callers and for spotting the resolution paths it does
+cover.
+
 ## Not measured here
 
 Multi-GPU, NVLS multicast, NCCL, CRIU (the node has none, and Ubuntu 22.04 ships

@@ -22,14 +22,14 @@ EXPECTED_DIRECT = {
 }
 
 
-def main(prefix):
+def main(prefix, expect_dlsym_hook):
     paths = sorted(glob.glob(f"{prefix}*"))
     if not paths:
         print(f"FAIL: the interposer wrote nothing to {prefix}*")
         print("      it was probably not loaded at all")
         return 1
 
-    calls, summary, redirects = [], {}, set()
+    calls, summary, redirects, dlsym_hits = [], {}, set(), set()
     for path in paths:
         with open(path) as fh:
             for line in fh:
@@ -43,6 +43,8 @@ def main(prefix):
                 elif record["event"] == "call":
                     if record["api"] == "cuGetProcAddress":
                         redirects.add(record["detail"])
+                    elif record["api"] == "dlsym":
+                        dlsym_hits.add(record["detail"])
                     else:
                         calls.append(record)
 
@@ -65,11 +67,22 @@ def main(prefix):
 
     # The probe calls cuMemCreate twice: once directly, once through the
     # pointer. Both must land, or the redirect returned the driver's function.
+    # Resolution paths the probe exercises: direct, cuGetProcAddress, and -
+    # where the platform supports interposing it - dlsym on a handle. The last
+    # is glibc-only; macOS builds compile the hook out, so the expectation is
+    # passed in rather than inferred. Inferring it would let a silently broken
+    # hook pass by simply never firing.
+    expected_creates = 3 if expect_dlsym_hook else 2
     creates = summary.get("cuMemCreate", 0)
-    if creates < 2:
+    if creates < expected_creates:
         problems.append(
-            f"cuMemCreate recorded {creates} time(s), expected 2 - the "
-            f"cuGetProcAddress-resolved call did not go through the wrapper"
+            f"cuMemCreate recorded {creates} time(s), expected {expected_creates} "
+            f"- one of the resolution paths did not go through the wrapper"
+        )
+    if expect_dlsym_hook and "cuMemCreate" not in dlsym_hits:
+        problems.append(
+            "dlsym(cuMemCreate) was not intercepted; a workload that resolves "
+            "driver entry points that way would be invisible to the audit"
         )
 
     fabric = [
@@ -109,10 +122,13 @@ def main(prefix):
     print(
         f"interposer ok: {len(calls)} calls, "
         f"{len(redirects)} cuGetProcAddress redirects, "
+        f"{len(dlsym_hits)} dlsym redirects, "
         f"{len(seen)} distinct APIs"
     )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/mncr-audit-test"))
+    prefix = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mncr-audit-test"
+    expect = len(sys.argv) > 2 and sys.argv[2] == "--expect-dlsym-hook"
+    sys.exit(main(prefix, expect))

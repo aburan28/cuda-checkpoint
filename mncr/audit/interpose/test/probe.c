@@ -3,6 +3,7 @@
  * cuGetProcAddress hands back. Both must show up in the audit log.
  */
 
+#include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,19 @@ int main(void)
     }
     /* handle type 8 is FABRIC in current headers: the MNNVL case */
     resolved_export(blob, handle, 8, 0);
+
+    /* dlopen + dlsym - how PyTorch and NCCL actually reach libcuda, and the
+     * bypass that LD_PRELOAD symbol interposition does not cover on its own. */
+    void *lib = dlopen("libfakecuda" LIBSUFFIX, RTLD_LAZY);
+    if (lib) {
+        fn_create via_dlsym = (fn_create)dlsym(lib, "cuMemCreate");
+        if (via_dlsym) {
+            via_dlsym(&handle, 3u << 20, NULL, 0);
+        } else {
+            fprintf(stderr, "dlsym(cuMemCreate) returned NULL\n");
+            return 1;
+        }
+    }
 
     printf("probe done\n");
     return 0;
