@@ -124,12 +124,17 @@ agree on a step to stop at, and keep training until they all reach it.
 
 ## On a GPU node
 
-Two commands stand between the simulator and real hardware. Run them in order.
-
 ```bash
+sudo ./bootstrap-node.sh --cuda-checkpoint ../bin/x86_64_Linux/cuda-checkpoint
 make preflight      # can this node participate? uses the real backends
 make smoke          # four levels: driver, +criu, +agent, +full epoch
 ```
+
+`bootstrap-node.sh` installs the utility, builds CRIU with its CUDA plugin (no
+distro ships 4.x with it, and the plugin is the whole point), and ends by
+running preflight. It is idempotent, so it belongs in cloud-init or a DaemonSet
+init container — which matters more than it sounds: a spot node reclaimed
+mid-session takes a hand-built CRIU with it.
 
 `preflight` checks tooling, driver and CRIU versions, the CUDA plugin,
 privileges, host RAM against device memory, and actually creates a job file. It

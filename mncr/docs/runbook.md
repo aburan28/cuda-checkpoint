@@ -1,5 +1,15 @@
 # Runbook
 
+## Provisioning a node
+
+```bash
+sudo ./bootstrap-node.sh --cuda-checkpoint /path/to/cuda-checkpoint
+```
+
+Idempotent, so it is safe in cloud-init or a DaemonSet init container. Put it
+there rather than running it by hand: a spot node that gets reclaimed takes its
+hand-built CRIU with it, and the next one comes back bare.
+
 ## Bring-up order
 
 Each step's exit criterion is the next step's precondition. Do not skip ahead;
