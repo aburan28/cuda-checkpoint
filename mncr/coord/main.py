@@ -147,9 +147,15 @@ class Coordinator:
         candidates = [
             e for e in self.store.retained(job_id) if e["epoch_id"] not in keep
         ]
-        deleted = []
+        deleted, incomplete = [], []
         for epoch in candidates:
-            nodes = sorted({r["node"] for r in epoch.get("ranks", [])})
+            # The images live where they were dumped, which a later restore
+            # onto other nodes does not change - `ranks` is the placement now,
+            # `images` is where the bytes are.
+            nodes = sorted(
+                {i["node"] for i in epoch.get("images", []) if i.get("node")}
+                or {r["node"] for r in epoch.get("ranks", [])}
+            )
             _results, errors = self.pool.fanout(
                 nodes,
                 "delete_images",
@@ -158,18 +164,23 @@ class Coordinator:
                 image_root=image_root or self.cfg.image_dir,
             )
             if errors:
+                # Not pruned: the bytes are still there, and an epoch marked
+                # pruned is never looked at again. The next sweep retries.
                 _LOG.warn(
-                    "image deletion incomplete",
+                    "image deletion incomplete; will retry",
                     epoch=epoch["epoch_id"],
                     errors=errors,
                 )
+                incomplete.append(epoch["epoch_id"])
+                continue
             self.store.mark_pruned(epoch["epoch_id"])
             deleted.append(epoch["epoch_id"])
 
         _LOG.info(
-            "gc complete", job=job_id, retained=len(keep), deleted=len(deleted)
+            "gc complete", job=job_id, retained=len(keep), deleted=len(deleted),
+            incomplete=len(incomplete),
         )
-        return {"kept": sorted(keep), "deleted": deleted}
+        return {"kept": sorted(keep), "deleted": deleted, "incomplete": incomplete}
 
     def status(self, job_id=None):
         return {

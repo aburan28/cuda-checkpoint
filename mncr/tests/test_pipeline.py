@@ -196,5 +196,44 @@ class TestSplit(unittest.TestCase):
         self.assertEqual(joined, b"")
 
 
+
+class TestRemoteDelete(unittest.TestCase):
+    def test_tiered_delete_reaches_both_tiers(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            local = LocalBackend(os.path.join(tmp, "local"))
+            src = os.path.join(tmp, "blob")
+            open(src, "wb").write(b"x")
+            local.put(src, "ep/rank-0/s.00000")
+
+            class Remote:
+                def __init__(self):
+                    self.deleted = []
+
+                def delete(self, key):
+                    self.deleted.append(key)
+                    return True
+
+                def exists(self, key):
+                    return False
+
+            remote = Remote()
+            tiered = TieredBackend(local, remote)
+            self.assertTrue(tiered.delete("ep/rank-0/s.00000"))
+            self.assertEqual(remote.deleted, ["ep/rank-0/s.00000"])
+            self.assertFalse(local.exists("ep/rank-0/s.00000"))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_remote_backend_runs_the_delete_template(self):
+        from imagestore.backends import RemoteBackend
+
+        ok = RemoteBackend("s3://bucket/prefix", delete_template="test -n {dst}")
+        self.assertTrue(ok.delete("ep/manifest.json"))
+        failing = RemoteBackend("s3://bucket/prefix", delete_template="false {dst}")
+        with self.assertRaises(RuntimeError):
+            failing.delete("ep/manifest.json")
+
+
 if __name__ == "__main__":
     unittest.main()

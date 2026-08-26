@@ -162,6 +162,20 @@ class PolicyTest(unittest.TestCase):
         after = len(self.sim.coord.store.list_epochs(self.sim.job_id))
         self.assertEqual(before, after, "a suspended policy still ran a checkpoint")
 
+    def test_a_success_resets_the_suspended_gauge(self):
+        from mncr import metrics
+
+        self._policy(suspendAfterFailures=5)
+        agent = self.sim.agents["node-0"]
+        pid = agent.local_ranks(self.sim.job_id)[0]["host_pid"]
+        agent.driver.fail_next("lock", pid)
+        self._tick()
+        self.sim.wait_for_event("resumed", timeout=20)
+        self._tick()
+        self.sim.wait_for_event("resumed", count=1, timeout=20)
+        line = [l for l in metrics.POLICY_SUSPENDED.render() if 'policy="p1"' in l][-1]
+        self.assertTrue(line.endswith(" 0"), line)
+
     def test_a_success_clears_the_failure_count(self):
         self._policy(suspendAfterFailures=3)
         agent = self.sim.agents["node-0"]
@@ -170,6 +184,76 @@ class PolicyTest(unittest.TestCase):
         self.assertEqual(self._tick()["consecutiveFailures"], 1)
         self.sim.wait_for_event("resumed", timeout=20)
         self.assertEqual(self._tick()["consecutiveFailures"], 0)
+
+
+
+class RetentionRobustnessTest(unittest.TestCase):
+    def setUp(self):
+        self.sim = SimCluster(nodes=2, ranks_per_node=2, step_seconds=0.002).start()
+        self.sim.launch_ranks()
+        self.sim.wait_registered()
+
+    def tearDown(self):
+        self.sim.stop()
+
+    def _stop_epoch(self):
+        return self.sim.coord.checkpoint(self.sim.job_id, mode="stop")["epoch_id"]
+
+    def test_an_epoch_whose_images_could_not_be_deleted_is_not_pruned(self):
+        old = self._stop_epoch()
+        self.sim.coord.restore(self.sim.job_id, old)
+        self.sim.wait_for_event("resumed", timeout=20)
+        new = self.sim.coord.checkpoint(self.sim.job_id, mode="continue")["epoch_id"]
+        self.sim.servers[1].stop()          # node-1 cannot be told to delete
+        result = self.sim.coord.gc(self.sim.job_id, retain=1)
+        self.assertEqual(result["incomplete"], [old])
+        self.assertEqual(result["deleted"], [])
+        retained = {e["epoch_id"] for e in self.sim.coord.store.retained(self.sim.job_id)}
+        self.assertIn(old, retained, "an epoch with images still on disk was marked pruned")
+        self.assertIn(new, retained)
+
+    def test_gc_deletes_where_the_images_are_not_where_the_ranks_went(self):
+        old = self._stop_epoch()
+        self.sim.coord.restore(self.sim.job_id, old)
+        self.sim.wait_for_event("resumed", timeout=20)
+        new = self._stop_epoch()
+        # The older image restored somewhere else: its `ranks` now say node-0
+        # only, while ranks 2 and 3's images are still on node-1's disk.
+        self.sim.coord.restore(self.sim.job_id, old, targets={"node-0": [0, 1, 2, 3]})
+        calls = []
+        real = self.sim.coord.pool.fanout
+
+        def spy(nodes, op, *args, **kwargs):
+            calls.append((op, sorted(nodes)))
+            return real(nodes, op, *args, **kwargs)
+
+        self.sim.coord.pool.fanout = spy
+        result = self.sim.coord.gc(self.sim.job_id, retain=1)
+        self.assertEqual(result["deleted"], [old])
+        self.assertIn(new, result["kept"])
+        deletes = [nodes for op, nodes in calls if op == "delete_images"]
+        self.assertEqual(deletes, [["node-0", "node-1"]])
+
+
+class UnreleasedAbortTest(unittest.TestCase):
+    def setUp(self):
+        self.sim = SimCluster(nodes=2, ranks_per_node=1, step_seconds=0.002).start()
+        self.sim.launch_ranks()
+        self.sim.wait_registered()
+        self.k8s = FakeK8s()
+        self.controller = Controller(self.sim.coord, client=self.k8s, namespace="test")
+
+    def tearDown(self):
+        self.sim.stop()
+
+    def test_the_status_says_the_job_is_not_intact(self):
+        self.sim.servers[1].stop()
+        self.k8s.add("gpucheckpoints", "c1", {"jobId": self.sim.job_id, "mode": "continue"})
+        self.controller.reconcile_checkpoint(self.k8s.objects["gpucheckpoints"]["c1"])
+        status = self.k8s.objects["gpucheckpoints"]["c1"]["status"]
+        self.assertEqual(status["phase"], "Failed")
+        self.assertEqual(status["reason"], "AbortedUnreleased")
+        self.assertFalse(status["jobIntact"])
 
 
 if __name__ == "__main__":

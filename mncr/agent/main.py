@@ -90,6 +90,7 @@ class Agent:
                 prefix,
                 os.environ.get("MNCR_OBJECT_PUT"),
                 os.environ.get("MNCR_OBJECT_GET"),
+                delete_template=os.environ.get("MNCR_OBJECT_DELETE"),
             )
             if prefix
             else None

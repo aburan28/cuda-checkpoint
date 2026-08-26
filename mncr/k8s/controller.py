@@ -10,7 +10,7 @@ import argparse
 import time
 
 from mncr import config, log, metrics
-from mncr.errors import AbortableError, TerminalError
+from mncr.errors import AbortableError, TerminalError, UnreleasedAbortError
 
 from .client import K8sClient
 
@@ -59,6 +59,23 @@ class Controller:
                 image_root=spec.get("imageRoot"),
                 reason=spec.get("reason", f"GpuCheckpoint/{name}"),
             )
+        except UnreleasedAbortError as exc:
+            # Aborted before the commit point, but a node could not be told
+            # to release its ranks: they are torn down and waiting. Nothing
+            # on a GPU was touched, and yet the job is not running.
+            self._set_status(
+                "gpucheckpoints",
+                name,
+                {
+                    "phase": "Failed",
+                    "reason": "AbortedUnreleased",
+                    "message": str(exc)[:900],
+                    "jobIntact": False,
+                    "finishedAt": _now(),
+                },
+            )
+            _LOG.error("checkpoint aborted with ranks unreleased", name=name, error=str(exc))
+            return
         except AbortableError as exc:
             # Nothing was lost. The job is still running.
             self._set_status(
@@ -186,6 +203,9 @@ class Controller:
             self._set_status("checkpointpolicies", name, update)
             return
 
+        # A success ends the failure streak, and the gauge has to say so
+        # too, or a recovered policy reads as suspended forever.
+        metrics.POLICY_SUSPENDED.set(0, policy=name, job=job_id)
         update = {
             "lastEpochId": result["epoch_id"],
             "lastCheckpointAt": _now(),

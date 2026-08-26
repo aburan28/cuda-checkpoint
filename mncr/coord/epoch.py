@@ -294,6 +294,12 @@ class EpochRunner:
         previous = {int(r["rank"]): r["node"] for r in epoch.get("ranks", [])}
         epoch["ranks"] = [dict(r) for r in ranks]
         epoch["phase"] = Phase.DUMPED.value
+        # A fresh mark, so the RESTORING transition measures the restore and
+        # not the time the image sat on disk.
+        epoch["history"].append(
+            {"at": time.time(), "from": Phase.DUMPED.value, "to": Phase.DUMPED.value,
+             "note": "restore requested"}
+        )
         self._save(epoch, Phase.RESTORING)
 
         per_node = self._per_node_ranks(epoch)
