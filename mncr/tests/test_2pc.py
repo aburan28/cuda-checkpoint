@@ -167,5 +167,62 @@ class TwoPhaseCommitTest(unittest.TestCase):
         self.assertEqual(report["lost"], [])
 
 
+
+class EveryRankVotesTest(unittest.TestCase):
+    """The rule: no checkpoint call until every rank has voted."""
+
+    def setUp(self):
+        self.sim = SimCluster(nodes=2, ranks_per_node=2, step_seconds=0.002).start()
+        self.sim.launch_ranks()
+        self.sim.wait_registered()
+
+    def tearDown(self):
+        self.sim.stop()
+
+    def test_a_rank_the_agent_never_saw_aborts_before_the_lock(self):
+        from mncr.proto import RankRef
+
+        refs = self.sim.rank_refs() + [RankRef.make(self.sim.job_id, 9, "node-1")]
+        self.sim.coord.register_job(self.sim.job_id, refs)
+        with self.assertRaises(AbortableError) as caught:
+            self.sim.coord.checkpoint(self.sim.job_id, mode="continue")
+        self.assertIn("9", str(caught.exception))
+        epochs = self.sim.coord.store.list_epochs(self.sim.job_id)
+        self.assertEqual(epochs[-1]["phase"], Phase.ABORTED.value)
+        for node, agent in self.sim.agents.items():
+            self.assertFalse(
+                any(action == "checkpoint" for action, _ in agent.driver.calls),
+                f"{node} issued a checkpoint call with a rank missing",
+            )
+        # The job survived. node-0's ranks entered the epoch and were released;
+        # node-1 refused before publishing the request, so its ranks never
+        # left the training loop at all.
+        self.assertTrue(self.sim.wait_for_event("resumed", count=2, timeout=30))
+        self.assertEqual(self.sim.alive(), 4)
+
+    def test_an_abort_that_cannot_reach_a_node_says_so(self):
+        # node-1's agent goes away: prepare fails there, and so does the abort.
+        from mncr.errors import UnreleasedAbortError
+
+        self.sim.servers[1].stop()
+        with self.assertRaises(UnreleasedAbortError):
+            self.sim.coord.checkpoint(self.sim.job_id, mode="continue")
+        epoch = self.sim.coord.store.list_epochs(self.sim.job_id)[-1]
+        self.assertEqual(epoch["phase"], Phase.ABORTED.value)
+        self.assertFalse(epoch["released"], "an abort that lost a node must not claim every rank was released")
+        self.assertIn("unreleased", epoch["error"])
+
+    def test_the_commit_is_recorded_before_the_first_checkpoint_call(self):
+        agent = self.sim.agents["node-1"]
+        pid = agent.local_ranks(self.sim.job_id)[0]["host_pid"]
+        agent.driver.fail_next("checkpoint", pid)
+        with self.assertRaises(TerminalError):
+            self.sim.coord.checkpoint(self.sim.job_id, mode="continue")
+        epoch = self.sim.coord.store.list_epochs(self.sim.job_id)[-1]
+        phases = [h["to"] for h in epoch["history"]]
+        self.assertIn(Phase.CHECKPOINTED.value, phases)
+        self.assertEqual(epoch["phase"], Phase.FAILED.value)
+
+
 if __name__ == "__main__":
     unittest.main()

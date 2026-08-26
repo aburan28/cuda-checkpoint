@@ -104,7 +104,26 @@ class Agent:
         return os.path.join(image_root, epoch_id, f"manifest-{self.node}.json")
 
     # ------------------------------------------------------------- inbound
-    def rank_register(self, job_id, rank, host_pid, world_size, gpu_uuids=None):
+    def _host_pid(self, reported, peer_pid):
+        """The pid the driver, criu and /proc will be given for a rank.
+
+        Never the number the rank sent, taken at face value: inside a pod
+        that is the pod's pid, and on the host it is somebody else. The unix
+        socket tells us the peer's real pid; over TCP the resolver has to
+        work it out, and refuses when it cannot.
+        """
+        if peer_pid:
+            return int(peer_pid), "peer"
+        if self.cfg.fake:
+            return int(reported), "fake"
+        try:
+            return self.pids.resolve(reported)
+        except LookupError as exc:
+            raise PreconditionError(f"cannot map rank pid {reported} to a host pid: {exc}")
+
+    def rank_register(self, job_id, rank, host_pid, world_size, gpu_uuids=None,
+                      peer_pid=None):
+        host_pid, how = self._host_pid(host_pid, peer_pid)
         record = RankRecord.make(job_id, rank, host_pid, world_size, gpu_uuids)
         with self._lock:
             self._ranks[(job_id, int(rank))] = record
@@ -112,10 +131,13 @@ class Agent:
         # registration is also how it learns a pid exists.
         if isinstance(self.driver, driver_mod.FakeBackend):
             self.driver.add_pid(host_pid)
-        _LOG.info("rank registered", job=job_id, rank=rank, pid=host_pid, node=self.node)
-        return {"node": self.node, "registered": True}
+        _LOG.info("rank registered", job=job_id, rank=rank, pid=host_pid, pid_from=how,
+                  node=self.node)
+        return {"node": self.node, "registered": True, "host_pid": host_pid}
 
-    def rank_vote(self, job_id, rank, epoch_id, vote, host_pid, findings=None, error=None):
+    def rank_vote(self, job_id, rank, epoch_id, vote, host_pid, findings=None, error=None,
+                  peer_pid=None):
+        host_pid, _how = self._host_pid(host_pid, peer_pid)
         key = (job_id, epoch_id)
         with self._lock:
             self._votes.setdefault(key, {})[int(rank)] = {
@@ -150,6 +172,24 @@ class Agent:
                 for (j, rk), r in sorted(self._ranks.items())
                 if j == job_id and rk in wanted
             ]
+
+    def _registered_ranks(self, job_id, ranks):
+        """local_ranks, refusing silently to narrow the set.
+
+        The coordinator names the ranks it expects on this node. If one of
+        them is not registered here, answering with the rest would let an
+        epoch proceed - and commit - with a rank that never voted. That is the
+        one thing the two-phase commit exists to prevent, so it is an error at
+        the point where it is still free.
+        """
+        local = self.local_ranks(job_id, ranks)
+        if ranks is not None:
+            missing = sorted({int(x) for x in ranks} - {int(r["rank"]) for r in local})
+            if missing:
+                raise PreconditionError(
+                    f"ranks {missing} of {job_id} are not registered on {self.node}"
+                )
+        return local
 
     def status(self, job_id=None):
         with self._lock:
@@ -188,7 +228,7 @@ class Agent:
     def prepare(self, job_id, epoch_id, ranks=None, lookahead=1, wait_timeout=None,
                 vote_timeout=None):
         """Publish the request and block until every local rank has voted."""
-        local = self.local_ranks(job_id, ranks)
+        local = self._registered_ranks(job_id, ranks)
         if not local:
             raise PreconditionError(f"no registered ranks for {job_id} on {self.node}")
 
@@ -243,7 +283,7 @@ class Agent:
 
     # ------------------------------------------------------------------ lock
     def lock(self, job_id, epoch_id, ranks=None, timeout_ms=None):
-        local = self.local_ranks(job_id, ranks)
+        local = self._registered_ranks(job_id, ranks)
         timeout_ms = int(timeout_ms or self.cfg.lock_timeout_ms)
         locked = []
         try:
@@ -268,7 +308,7 @@ class Agent:
     # ------------------------------------------------------------ checkpoint
     def checkpoint(self, job_id, epoch_id, ranks=None):
         """Past this call there is no way back for the affected ranks."""
-        local = self.local_ranks(job_id, ranks)
+        local = self._registered_ranks(job_id, ranks)
         done = []
         for record in local:
             pid = record["host_pid"]
@@ -282,7 +322,7 @@ class Agent:
     # ------------------------------------------------------------------ dump
     def dump(self, job_id, epoch_id, image_root, ranks=None, external=None,
              store=True):
-        local = self.local_ranks(job_id, ranks)
+        local = self._registered_ranks(job_id, ranks)
         images, entries = [], []
         for record in local:
             pid = record["host_pid"]
@@ -456,15 +496,22 @@ class Agent:
         authoritative and the pids come from criu.
         """
         local = self.local_ranks(job_id, ranks)
-        if local or not from_images:
+        if not from_images:
             return local
         if not ranks:
+            if local:
+                return local
             raise PreconditionError(
                 f"restore on {self.node} needs an explicit rank list: no ranks "
                 f"of {job_id} are registered here"
             )
+        # The requested list is authoritative. A rank already registered here
+        # keeps its record; one arriving from elsewhere gets a fresh one and
+        # its pid from criu. Returning only the registered ones would restore
+        # part of what was asked and report success for all of it.
+        known = {int(r["rank"]): r for r in local}
         return [
-            RankRecord.make(job_id, rank, 0, len(ranks), [])
+            known.get(rank) or RankRecord.make(job_id, rank, 0, len(ranks), [])
             for rank in sorted(int(r) for r in ranks)
         ]
 

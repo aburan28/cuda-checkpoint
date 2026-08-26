@@ -157,5 +157,44 @@ class TestImageCache(unittest.TestCase):
         self.assertNotIn("a", evicted)
 
 
+
+class TestSplit(unittest.TestCase):
+    """Splitting streams; it never holds a shard in memory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _split(self, payload, shard_bytes, block):
+        from imagestore.pipeline import _split
+
+        src = os.path.join(self.tmp, "in")
+        with open(src, "wb") as fh:
+            fh.write(payload)
+        shards = _split(src, shard_bytes, os.path.join(self.tmp, "out"), "p", block=block)
+        joined = b"".join(open(path, "rb").read() for _, path in shards)
+        return shards, joined
+
+    def test_blocks_smaller_than_shards_reassemble(self):
+        payload = os.urandom(10_000)
+        shards, joined = self._split(payload, shard_bytes=4096, block=1000)
+        self.assertEqual([os.path.getsize(p) for _, p in shards], [4096, 4096, 1808])
+        self.assertEqual(joined, payload)
+
+    def test_no_empty_trailing_shard_on_a_boundary(self):
+        payload = os.urandom(8192)
+        shards, joined = self._split(payload, shard_bytes=4096, block=4096)
+        self.assertEqual(len(shards), 2)
+        self.assertEqual(joined, payload)
+        self.assertEqual(sorted(os.listdir(os.path.join(self.tmp, "out"))), ["p.00000", "p.00001"])
+
+    def test_an_empty_input_is_one_empty_shard(self):
+        shards, joined = self._split(b"", shard_bytes=4096, block=64)
+        self.assertEqual(len(shards), 1)
+        self.assertEqual(joined, b"")
+
+
 if __name__ == "__main__":
     unittest.main()

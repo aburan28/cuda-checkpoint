@@ -20,6 +20,13 @@ class TerminalError(MncrError):
     """Failed after the commit point. The epoch is lost; ranks must be replaced."""
 
 
+class UnreleasedAbortError(AbortableError):
+    """Aborted before the commit point, but a node could not be reached to
+    release its ranks. Nothing on a GPU was touched, so the epoch is not
+    FAILED - yet ranks on that node are torn down and waiting for a token
+    that will not come, and the job is not intact."""
+
+
 class PreconditionError(AbortableError):
     """A rank or node did not meet a documented precondition."""
 

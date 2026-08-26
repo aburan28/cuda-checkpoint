@@ -72,22 +72,37 @@ def _decompress(src, dst, codec):
     return dst
 
 
-def _split(path, shard_bytes, out_dir, prefix):
+#: Copy granularity for splitting. Shards are a gigabyte by default and eight
+#: ranks pack in parallel; reading a shard whole would put 8 GiB on the heap
+#: inside the agent's dump, past the commit point, where an OOM kill loses the
+#: epoch. Streaming keeps the peak at workers * block.
+SPLIT_BLOCK = 8 << 20
+
+
+def _split(path, shard_bytes, out_dir, prefix, block=SPLIT_BLOCK):
     """Split one file into fixed-size shards. Returns [(name, path)]."""
     os.makedirs(out_dir, exist_ok=True)
     shards = []
     with open(path, "rb") as fh:
         index = 0
         while True:
-            chunk = fh.read(shard_bytes)
-            if not chunk:
-                break
             name = f"{prefix}.{index:05d}"
             shard_path = os.path.join(out_dir, name)
+            written = 0
             with open(shard_path, "wb") as out:
-                out.write(chunk)
+                while written < shard_bytes:
+                    chunk = fh.read(min(block, shard_bytes - written))
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+            if written == 0 and index > 0:
+                os.unlink(shard_path)      # the input ended on a shard boundary
+                break
             shards.append((name, shard_path))
             index += 1
+            if written < shard_bytes:
+                break
     if not shards:  # an empty image is still an image
         name = f"{prefix}.00000"
         shard_path = os.path.join(out_dir, name)

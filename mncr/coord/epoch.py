@@ -11,7 +11,7 @@ Everything else here is bookkeeping around that rule.
 import time
 
 from mncr import log
-from mncr.errors import AbortableError, TerminalError
+from mncr.errors import AbortableError, TerminalError, UnreleasedAbortError
 from mncr.proto import Epoch, Phase, Vote
 
 _LOG = log.get("coord.epoch")
@@ -52,11 +52,23 @@ class EpochRunner:
             init_method=init_method,
             world_size=len(epoch["ranks"]),
         )
+        # Whether every rank was released. The epoch is still aborted rather
+        # than committed - no GPU state was touched - but ranks on a node the
+        # abort could not reach have torn down and are waiting for a token
+        # that will not come, and the job is not intact. The controller reads
+        # this field; it must not report jobIntact=true on the phase alone.
+        epoch["released"] = not errors
         if errors:
-            # A node that cannot even unlock leaves ranks stuck; surface it
-            # loudly, but the epoch is still aborted rather than committed.
-            _LOG.error("abort incomplete", epoch=epoch["epoch_id"], errors=errors)
+            _LOG.error("abort incomplete; ranks unreleased", epoch=epoch["epoch_id"],
+                       errors=errors)
+            reason = f"{reason}; abort incomplete on {sorted(errors)}, ranks there are unreleased"
         self._save(epoch, Phase.ABORTED, note=reason, error=reason)
+        if errors:
+            # Raised here, ahead of the caller's own AbortableError, so the
+            # distinction reaches whoever reports on the job.
+            raise UnreleasedAbortError(
+                f"epoch {epoch['epoch_id']} aborted ({reason}); the job is not intact"
+            )
         return results, errors
 
     def _fail(self, epoch, reason):
@@ -108,19 +120,32 @@ class EpochRunner:
             per_node_args=per_node,
             job_id=job_id,
             epoch_id=epoch["epoch_id"],
-            wait_timeout=self.cfg.checkpoint_timeout,
+            # The rank waits for its token through lock, checkpoint, dump and
+            # restore; its budget has to outlast the dump, which is the slow
+            # part, or a large image ends with every rank timing out just as
+            # its token arrives.
+            wait_timeout=self.cfg.checkpoint_timeout + self.cfg.dump_timeout,
             vote_timeout=self.cfg.quiesce_timeout,
             _timeout=self.cfg.quiesce_timeout + 60,
         )
         votes = {}
         for node, result in results.items():
             for vote in result.get("votes", []):
-                votes[vote["rank"]] = vote
+                votes[int(vote["rank"])] = vote
         epoch["votes"] = votes
 
         if errors:
             self._abort(epoch, f"prepare failed on {sorted(errors)}", init_method)
             raise AbortableError(f"prepare failed: {errors}")
+
+        # The rule, checked rather than assumed: every rank in the epoch has a
+        # vote. The agents refuse to narrow the rank set, so this should never
+        # fire; it is here so that a bug on their side cannot commit an epoch
+        # that is missing a rank.
+        missing = sorted({int(r["rank"]) for r in epoch["ranks"]} - set(votes))
+        if missing:
+            self._abort(epoch, f"no vote from ranks {missing}", init_method)
+            raise AbortableError(f"no vote from ranks {missing}")
 
         dirty = [v for v in votes.values() if v["vote"] != Vote.CLEAN.value]
         if dirty:
@@ -150,6 +175,12 @@ class EpochRunner:
         self._save(epoch, Phase.LOCKED)
 
         # ------------------------------------------------ COMMIT POINT below
+        # Recorded before the first checkpoint call goes out, not after the
+        # last returns: a coordinator that dies during the fan-out must come
+        # back believing the epoch committed, because some rank may have.
+        # Classifying it as abortable would invite an unlock on a process
+        # that has already released its GPU.
+        self._save(epoch, Phase.CHECKPOINTED, note="checkpoint calls in flight")
         results, errors = self.pool.fanout(
             nodes,
             "checkpoint",
@@ -158,7 +189,6 @@ class EpochRunner:
             epoch_id=epoch["epoch_id"],
             _timeout=self.cfg.checkpoint_timeout,
         )
-        self._save(epoch, Phase.CHECKPOINTED)
         if errors:
             self._fail(epoch, f"checkpoint failed on {sorted(errors)}: {errors}")
 

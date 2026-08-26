@@ -10,8 +10,10 @@ Address forms:
     "tcp:0.0.0.0:7181"            TCP
 """
 
+import inspect
 import socket
 import socketserver
+import struct
 import threading
 
 from . import log
@@ -34,8 +36,35 @@ def parse_addr(addr):
     raise ValueError(f"unsupported address {addr!r}")
 
 
+def peer_pid(sock):
+    """The connecting process's pid, as this process sees it. AF_UNIX only.
+
+    This is how the agent learns a rank's host pid without trusting the rank:
+    a process in a pod reports the pid it has inside the pod, which means
+    nothing to the driver, but SO_PEERCRED is translated by the kernel into
+    the receiver's pid namespace - the host's, since the agent runs there.
+    None over TCP, or on a platform without SO_PEERCRED.
+    """
+    if sock.family != socket.AF_UNIX or not hasattr(socket, "SO_PEERCRED"):
+        return None
+    try:
+        creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        pid, _uid, _gid = struct.unpack("3i", creds)
+    except (OSError, struct.error):
+        return None
+    return pid or None
+
+
+def accepts_peer_pid(fn):
+    try:
+        return "peer_pid" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
+        pid = peer_pid(self.request)
         while True:
             line = self.rfile.readline(_MAX_LINE)
             if not line:
@@ -49,7 +78,7 @@ class _Handler(socketserver.StreamRequestHandler):
                 self.wfile.write(Message.err("?", f"malformed request: {exc}").encode())
                 self.wfile.flush()
                 return
-            resp = self.server.dispatch(req)
+            resp = self.server.dispatch(req, peer_pid=pid)
             self.wfile.write(resp.encode())
             self.wfile.flush()
 
@@ -71,6 +100,7 @@ class Server:
         self.addr = addr
         self.name = name
         self._ops = {}
+        self._wants_peer = {}
         self._srv = None
         self._thread = None
         family, target = parse_addr(addr)
@@ -88,16 +118,23 @@ class Server:
     def op(self, name):
         def deco(fn):
             self._ops[name] = fn
+            self._wants_peer[name] = accepts_peer_pid(fn)
             return fn
 
         return deco
 
-    def _dispatch(self, req):
-        fn = self._ops.get(req.get("op"))
+    def _dispatch(self, req, peer_pid=None):
+        name = req.get("op")
+        fn = self._ops.get(name)
         if fn is None:
-            return Message.err(req.get("id", "?"), f"unknown op {req.get('op')!r}")
+            return Message.err(req.get("id", "?"), f"unknown op {name!r}")
+        args = dict(req.get("args", {}))
+        if peer_pid is not None and self._wants_peer.get(name):
+            # Handed to handlers that ask for it; never something the caller
+            # can set, since it overrides whatever they sent.
+            args["peer_pid"] = peer_pid
         try:
-            result = fn(**req.get("args", {}))
+            result = fn(**args)
             return Message.ok(req["id"], **(result or {}))
         except Exception as exc:  # handlers convert their own domain errors
             _LOG.warn("op failed", server=self.name, op=req.get("op"), error=str(exc))

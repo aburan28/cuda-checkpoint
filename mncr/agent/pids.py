@@ -64,6 +64,44 @@ class PidResolver:
         except (FileNotFoundError, PermissionError):
             return ""
 
+    def resolve(self, reported):
+        """The host pid behind a pid a rank reported about itself.
+
+        A rank sends os.getpid(). In a pod that is the pid inside the pod's
+        namespace, and the same number belongs to some other process on the
+        host. Returns (host_pid, how), where `how` says which reading held:
+
+            host        the number names a host-namespace process, so it is
+                        already a host pid
+            translated  exactly one process has that number as its innermost
+                        pid, so it is that process's host pid
+
+        Raises LookupError when neither reading is safe - no such process, or
+        the same inner pid in more than one namespace. The remedy for the
+        latter is the unix socket, where the kernel reports the peer's pid
+        directly; see mncr.rpc.peer_pid.
+        """
+        reported = int(reported)
+        ns = self._ns_pids(reported)
+        if len(ns) == 1:
+            return reported, "host"
+        if not ns and os.path.isdir(os.path.join(self.proc_root, str(reported))):
+            # A kernel without NSpid (pre-4.1): nothing to translate with.
+            return reported, "unverified"
+        matches = [
+            pid for pid in self.all_pids()
+            if (self._ns_pids(pid) or [None])[-1] == reported
+        ]
+        if len(matches) == 1:
+            return matches[0], "translated"
+        if not matches:
+            raise LookupError(f"no process has pid {reported} in its innermost namespace")
+        raise LookupError(
+            f"pid {reported} is the innermost pid of {len(matches)} processes "
+            f"({sorted(matches)[:6]}); have the rank register over the unix "
+            f"socket so the agent can read the peer pid"
+        )
+
     def pids_in_cgroup(self, needle):
         """Every host pid whose cgroup path contains `needle`.
 

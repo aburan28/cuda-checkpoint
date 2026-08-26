@@ -113,5 +113,29 @@ class EndToEndTest(unittest.TestCase):
         self.assertEqual(len(cli.split(",")), len(uuids))
 
 
+
+class PartialMigrationTest(unittest.TestCase):
+    def setUp(self):
+        self.sim = SimCluster(nodes=2, ranks_per_node=2, step_seconds=0.002).start()
+        self.sim.launch_ranks()
+        self.sim.wait_registered()
+
+    def tearDown(self):
+        self.sim.stop()
+
+    def test_a_node_that_already_holds_ranks_restores_the_newcomers_too(self):
+        result = self.sim.coord.checkpoint(self.sim.job_id, mode="stop")
+        # rank 2 joins node-0, which already holds 0 and 1
+        targets = {"node-0": [0, 1, 2], "node-1": [3]}
+        restored = self.sim.coord.restore(self.sim.job_id, result["epoch_id"], targets=targets)
+        self.assertEqual(restored["phase"], Phase.RUNNING.value)
+        owned = sorted(r["rank"] for r in self.sim.agents["node-0"].local_ranks(self.sim.job_id))
+        self.assertEqual(owned, [0, 1, 2])
+        self.assertEqual(
+            sorted(r["rank"] for r in self.sim.agents["node-1"].local_ranks(self.sim.job_id)), [3]
+        )
+        self.assertEqual(len(self.sim.agents["node-0"].criu.restores), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
