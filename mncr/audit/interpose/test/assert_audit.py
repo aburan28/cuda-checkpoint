@@ -72,7 +72,9 @@ def main(prefix, expect_dlsym_hook):
     # is glibc-only; macOS builds compile the hook out, so the expectation is
     # passed in rather than inferred. Inferring it would let a silently broken
     # hook pass by simply never firing.
-    expected_creates = 3 if expect_dlsym_hook else 2
+    # With the hook, a fourth: cuMemCreate resolved through a cuGetProcAddress
+    # that was itself obtained by dlsym, which is the path PyTorch takes.
+    expected_creates = 4 if expect_dlsym_hook else 2
     creates = summary.get("cuMemCreate", 0)
     if creates < expected_creates:
         problems.append(
@@ -83,6 +85,11 @@ def main(prefix, expect_dlsym_hook):
         problems.append(
             "dlsym(cuMemCreate) was not intercepted; a workload that resolves "
             "driver entry points that way would be invisible to the audit"
+        )
+    if expect_dlsym_hook and "cuGetProcAddress" not in dlsym_hits:
+        problems.append(
+            "dlsym(cuGetProcAddress) handed back the driver's resolver; every "
+            "entry point PyTorch resolves through it would be invisible"
         )
 
     fabric = [

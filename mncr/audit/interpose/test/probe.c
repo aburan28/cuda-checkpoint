@@ -20,6 +20,7 @@ extern CUresult cuGetProcAddress(const char *, void **, int, uint64_t);
 
 typedef CUresult (*fn_create)(void *, size_t, const void *, unsigned long long);
 typedef CUresult (*fn_export)(void *, void *, int, unsigned long long);
+typedef CUresult (*fn_getproc)(const char *, void **, int, uint64_t);
 
 int main(void)
 {
@@ -63,6 +64,19 @@ int main(void)
             fprintf(stderr, "dlsym(cuMemCreate) returned NULL\n");
             return 1;
         }
+
+        /* What PyTorch actually does: dlsym the resolver once, then resolve
+         * everything else through it. If the resolver handed back is the
+         * driver's, every later entry point bypasses the audit. */
+        fn_getproc getproc = (fn_getproc)dlsym(lib, "cuGetProcAddress");
+        fn_create via_getproc = NULL;
+        if (!getproc ||
+            getproc("cuMemCreate", (void **)&via_getproc, 12080, 0) != 0 ||
+            !via_getproc) {
+            fprintf(stderr, "dlsym(cuGetProcAddress) chain failed\n");
+            return 1;
+        }
+        via_getproc(&handle, 4u << 20, NULL, 0);
     }
 
     printf("probe done\n");

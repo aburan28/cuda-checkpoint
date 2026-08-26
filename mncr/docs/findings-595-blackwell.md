@@ -203,16 +203,20 @@ the auditor recorded nothing at all. Not `cuMemCreate`, not `cuMemMap`, and not
 `cuMemAddressReserve`, which no VMM allocation can skip. The same hooks, in the
 same container, record all three from a C program.
 
-The mechanism was not established by black-box probing and is not guessed at
-here.
+The mechanism was not established by black-box probing at the time. Review of
+the interposer found it afterwards: PyTorch and NCCL `dlsym` exactly one
+symbol from libcuda, `cuGetProcAddress`, and resolve every other entry point
+through the pointer they get back. The hook redirected the entry points but
+handed back the driver's own resolver, so every lookup made through it landed
+inside libcuda and the redirect table was never consulted. The hook now returns
+its own `cuGetProcAddress` (and `_v2`, by requested version) for that lookup,
+and the test probe takes the same path. This is proven against the stand-in
+driver under `LD_PRELOAD`; it has not yet been re-measured against torch.
 
-**The consequence is what matters: an empty audit report for a PyTorch workload
-is not evidence that the workload is clean on this stack.** Do not treat it as
-one. Until the gap is understood, the trustworthy signal is the driver's own
-verdict - run the allocation the workload uses in a canary and try to checkpoint
-it, which is exactly what `verify/vmm_probe.cu` does. The interposer remains
-useful for non-PyTorch callers and for spotting the resolution paths it does
-cover.
+**Until it has: an empty audit report for a PyTorch workload is not evidence
+that the workload is clean on this stack.** The trustworthy signal is the
+driver's own verdict - run the allocation the workload uses in a canary and try
+to checkpoint it, which is exactly what `verify/vmm_probe.cu` does.
 
 ## Not measured here
 

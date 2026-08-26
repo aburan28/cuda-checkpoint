@@ -111,5 +111,48 @@ class TestVerifier(unittest.TestCase):
         self.assertEqual(len(findings), 1)
 
 
+
+class TestResumeUnknownState(unittest.TestCase):
+    """resume() must not report success for a process it could not read."""
+
+    class _Backend:
+        def __init__(self, states, restore_error):
+            self.states = list(states)
+            self.restore_error = restore_error
+            self.unlocked = False
+
+        def get_state(self, pid):
+            state = self.states.pop(0)
+            if isinstance(state, Exception):
+                raise state
+            return state
+
+        def restore(self, pid, device_map=None):
+            raise DriverError(self.restore_error)
+
+        def unlock(self, pid):
+            self.unlocked = True
+
+    def test_unknown_then_running_is_success(self):
+        from agent.driver import ALREADY, resume
+
+        backend = self._Backend([DriverError("no state"), STATE_RUNNING], ALREADY)
+        self.assertEqual(resume(backend, 7), "already-running")
+
+    def test_unknown_then_not_running_is_an_error(self):
+        from agent.driver import ALREADY, resume
+
+        backend = self._Backend([DriverError("no state"), "locked"], ALREADY)
+        with self.assertRaises(DriverError):
+            resume(backend, 7)
+
+    def test_unknown_and_unreadable_is_an_error(self):
+        from agent.driver import ALREADY, resume
+
+        backend = self._Backend([DriverError("no state"), DriverError("still no state")], ALREADY)
+        with self.assertRaises(DriverError):
+            resume(backend, 7)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,8 +66,11 @@ otherwise only testable on hardware:
   including that calls resolved through `cuGetProcAddress` and through
   `dlsym` on a handle both went through the wrapper. Interposing the symbol
   alone would pass a naive test and miss how frameworks actually reach libcuda.
-  Note the measured caveat: it does **not** see PyTorch's own allocations, so an
-  empty report is not proof of a clean workload —
+  Measured against real torch it saw nothing; review found why - torch resolves
+  everything through a `cuGetProcAddress` it obtains by `dlsym`, and the hook
+  handed back the driver's resolver - and that path is now hooked and tested
+  against the stand-in driver, but not yet re-measured against torch. Until it
+  is, an empty report is not proof of a clean workload —
   [findings](docs/findings-595-blackwell.md).
 - **Step agreement runs against a real process group.** gloo on CPU gives real
   collectives without a GPU, so `tests/test_collectives.py` proves ranks

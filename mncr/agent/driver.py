@@ -216,6 +216,16 @@ def resume(backend, pid, device_map=None, log=None):
         except DriverError as exc:
             if ALREADY not in str(exc):
                 raise
+            if state is None:
+                # The state was never learned and the driver says a restore
+                # does not apply. That is only success if the process is in
+                # fact running; ask again rather than call the unknown fine.
+                confirmed = backend.get_state(pid)
+                if confirmed != STATE_RUNNING:
+                    raise DriverError(
+                        f"pid {pid} is {confirmed!r}: restore is not applicable and "
+                        f"the process is not running"
+                    ) from exc
             if log:
                 log.info("restore already performed", pid=pid)
             return "already-running"

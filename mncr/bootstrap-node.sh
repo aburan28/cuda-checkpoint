@@ -79,10 +79,22 @@ if command -v criu >/dev/null; then
   note "found criu ${installed:-unknown}"
 fi
 
+need_build=1
 if [ "${installed_major:-0}" -ge "$CRIU_MIN_MAJOR" ] 2>/dev/null; then
-  note "already at or above $CRIU_MIN_MAJOR.x, not rebuilding"
+  if [ -f "$PLUGIN_DIR/cuda_plugin.so" ] || [ -f "$BUILD_DIR/plugins/cuda/cuda_plugin.so" ]; then
+    note "already at or above $CRIU_MIN_MAJOR.x with the CUDA plugin, not rebuilding"
+    need_build=0
+  else
+    # A 4.x from a distro or a previous hand-build without the plugin is not
+    # usable and cannot be fixed by copying anything: the plugin comes from
+    # the source tree, so build it.
+    note "criu ${installed:-?} is new enough but has no CUDA plugin; building from source to get one"
+  fi
 else
   note "need $CRIU_MIN_MAJOR.x or higher; distro packages ship 3.x without the CUDA plugin"
+fi
+
+if [ "$need_build" -eq 1 ]; then
   say "installing build dependencies"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq >/dev/null 2>&1

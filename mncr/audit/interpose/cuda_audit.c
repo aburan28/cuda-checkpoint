@@ -430,6 +430,28 @@ static void *redirect_for(const char *symbol)
 #ifdef MNCR_HOOK_DLSYM
 /* The bypass that matters. PyTorch and NCCL dlopen libcuda and dlsym their way
  * in; without this hook an audit of either comes back empty and reads as clean. */
+CUresult cuGetProcAddress(const char *symbol, void **pfn, int cuda_version,
+                          uint64_t flags);
+CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cuda_version,
+                             uint64_t flags, void *status);
+
+/*
+ * The entry point that hands out entry points has to be ours too. PyTorch and
+ * NCCL dlsym("cuGetProcAddress") once and resolve everything else through the
+ * pointer they get back; if that pointer is the driver's, every later lookup
+ * lands inside libcuda and the table above is never consulted. Measured: a
+ * torch workload with expandable segments engaged recorded nothing at all.
+ */
+static void *proc_address_wrapper(const char *symbol, int cuda_version)
+{
+    if (strcmp(symbol, "cuGetProcAddress_v2") == 0)
+        return (void *)cuGetProcAddress_v2;
+    if (strcmp(symbol, "cuGetProcAddress") == 0)
+        return cuda_version >= 12000 ? (void *)cuGetProcAddress_v2
+                                     : (void *)cuGetProcAddress;
+    return NULL;
+}
+
 void *dlsym(void *handle, const char *symbol)
 {
     init_real_dlsym();
@@ -437,7 +459,11 @@ void *dlsym(void *handle, const char *symbol)
         /* Nothing safe to do: returning NULL would break the caller. */
         return NULL;
     }
-    void *ours = redirect_for(symbol);
+    void *ours = proc_address_wrapper(symbol, 0);
+    if (!ours && strcmp(symbol, "cuGetProcAddress") == 0)
+        ours = (void *)cuGetProcAddress;
+    if (!ours)
+        ours = redirect_for(symbol);
     if (ours) {
         record("dlsym", "info", symbol);
         return ours;
@@ -452,7 +478,9 @@ CUresult cuGetProcAddress(const char *symbol, void **pfn, int cuda_version,
 {
     REAL("cuGetProcAddress", fn_getproc);
     CUresult rc = real(symbol, pfn, cuda_version, flags);
-    void *ours = redirect_for(symbol);
+    void *ours = proc_address_wrapper(symbol, cuda_version);
+    if (!ours)
+        ours = redirect_for(symbol);
     if (rc == 0 && ours && pfn) {
         record("cuGetProcAddress", "info", symbol);
         *pfn = ours;
@@ -466,7 +494,9 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cuda_version,
 {
     REAL("cuGetProcAddress_v2", fn_getproc2);
     CUresult rc = real(symbol, pfn, cuda_version, flags, status);
-    void *ours = redirect_for(symbol);
+    void *ours = proc_address_wrapper(symbol, cuda_version);
+    if (!ours)
+        ours = redirect_for(symbol);
     if (rc == 0 && ours && pfn) {
         record("cuGetProcAddress", "info", symbol);
         *pfn = ours;
