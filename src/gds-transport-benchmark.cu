@@ -262,7 +262,19 @@ class OutputFiles {
         }
     }
 
-    void track(const std::string &path) { paths_.push_back(path); }
+    // Only a file this run is about to create is ours to remove. The
+    // benchmark opens with O_CREAT|O_EXCL, so a path that already exists
+    // fails the run - and the file behind it belongs to somebody else.
+    void track(const std::string &path)
+    {
+        if (access(path.c_str(), F_OK) == 0) {
+            std::fprintf(stderr,
+                         "warning: %s already exists and will not be removed\n",
+                         path.c_str());
+            return;
+        }
+        paths_.push_back(path);
+    }
 
   private:
     bool keep_;
