@@ -68,7 +68,13 @@ _FD_RULES = [
         re.compile(r"^/dev/gdrdrv"),
         "gdrcopy_fd",
         Severity.BEFORE_LOCK,
-        "GDRCopy pins device memory for the NIC; must be released first",
+        # Measured: aws-ofi-nccl's libfabric opens this at plugin init - on a
+        # node with no EFA, where the plugin then fails and NCCL falls back to
+        # sockets - and never closes it. Nothing in the process can release
+        # it after the fact; it has to be prevented at launch.
+        "GDRCopy handle; CRIU cannot dump it and destroying the communicator "
+        "does not close it. Launch with FI_HMEM_CUDA_USE_GDRCOPY=0 (keeps EFA) "
+        "or NCCL_NET_PLUGIN=none",
     ),
     (
         re.compile(r"^/dev/nvidia-uvm"),
@@ -115,12 +121,83 @@ _MAP_RULES = [
 ]
 
 
+_TCP_STATES = {
+    "01": "ESTABLISHED", "02": "SYN_SENT", "03": "SYN_RECV", "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2", "06": "TIME_WAIT", "07": "CLOSE", "08": "CLOSE_WAIT",
+    "09": "LAST_ACK", "0A": "LISTEN", "0B": "CLOSING",
+}
+
+# A TCP socket is a local address CRIU has to bind again on restore, and a
+# bind that fails - the port taken by anything else on the target - fails the
+# restore, past the commit point. Measured: NCCL's RAS subsystem leaves two
+# listeners behind after every communicator is destroyed, one on
+# 127.0.0.1:28028 and one on the node address, and a restore on the same node
+# lost the epoch to exactly that. A clean rank holds none, so this is free.
+_SOCKET_WHY = {
+    "LISTEN": (
+        "listening socket survives teardown; CRIU must rebind the port on "
+        "restore. NCCL RAS is the usual owner: launch with NCCL_RAS_ENABLE=0"
+    ),
+    "*": (
+        "TCP socket survives teardown; CRIU must rebind its local port on "
+        "restore and its peer is at a different address after a migration"
+    ),
+}
+
+
+def _decode_addr(hex_addr):
+    host, _, port = hex_addr.partition(":")
+    if len(host) == 8:
+        return ".".join(str(int(host[i:i + 2], 16)) for i in (6, 4, 2, 0)) + f":{int(port, 16)}"
+    return f"[{host}]:{int(port, 16)}"
+
+
 class ProcScanner:
     def __init__(self, root="/proc"):
         self.root = root
 
     def available(self):
         return os.path.isdir(self.root)
+
+    # ------------------------------------------------------------ sockets
+    def _tcp_table(self, pid):
+        """inode -> (local, remote, state), from the process's own net view."""
+        table = {}
+        for name in ("tcp", "tcp6"):
+            path = os.path.join(self.root, str(pid), "net", name)
+            try:
+                with open(path) as fh:
+                    next(fh, None)
+                    for line in fh:
+                        parts = line.split()
+                        if len(parts) < 10:
+                            continue
+                        table[parts[9]] = (
+                            _decode_addr(parts[1]),
+                            _decode_addr(parts[2]),
+                            _TCP_STATES.get(parts[3], parts[3]),
+                        )
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+        return table
+
+    def _socket_findings(self, pid, fd_targets):
+        sockets = [(fd, t[8:-1]) for fd, t in fd_targets if t.startswith("socket:[")]
+        if not sockets:
+            return []
+        table = self._tcp_table(pid)
+        out = []
+        for fd, inode in sockets:
+            entry = table.get(inode)
+            if entry is None:
+                continue          # unix, udp, netlink: CRIU copes, or the peer is inside the tree
+            local, remote, state = entry
+            kind = "listening_socket" if state == "LISTEN" else "tcp_socket"
+            why = _SOCKET_WHY["LISTEN" if state == "LISTEN" else "*"]
+            out.append(
+                Finding(kind, Severity.BEFORE_LOCK, f"fd {fd} {state} {local} -> {remote}", why)
+            )
+        return out
 
     # ---------------------------------------------------------------- fds
     def _fd_targets(self, pid):
@@ -156,11 +233,13 @@ class ProcScanner:
     def scan(self, pid):
         """All findings for `pid`, unfiltered."""
         findings = []
-        for fd, target in self._fd_targets(pid):
+        fd_targets = self._fd_targets(pid)
+        for fd, target in fd_targets:
             for pattern, kind, sev, why in _FD_RULES:
                 if pattern.match(target):
                     findings.append(Finding(kind, sev, f"fd {fd} -> {target}", why))
                     break
+        findings.extend(self._socket_findings(pid, fd_targets))
         seen_maps = set()
         for path in self._map_paths(pid):
             for pattern, kind, sev, why in _MAP_RULES:

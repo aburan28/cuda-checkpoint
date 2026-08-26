@@ -47,6 +47,23 @@ def to_cli(pairs):
     return ",".join(f"{old}={new}" for old, new in pairs)
 
 
+def parse_cli(text):
+    """The inverse of to_cli. Tolerates blanks; does not validate UUIDs."""
+    pairs = []
+    for item in str(text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        old, _, new = item.partition("=")
+        pairs.append((old.strip(), new.strip()))
+    return pairs
+
+
+def is_identity_cli(text):
+    """True for an empty map or one that moves nothing."""
+    return is_identity(parse_cli(text))
+
+
 def to_api(pairs):
     """CUcheckpointGpuPair-shaped list, for callers using the driver API."""
     return [{"oldUuid": old, "newUuid": new} for old, new in pairs]

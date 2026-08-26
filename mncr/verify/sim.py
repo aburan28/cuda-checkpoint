@@ -58,6 +58,11 @@ class SimCluster:
         cfg.checkpoint_timeout = 60.0
         cfg.strict_clean = True
         cfg.fake_call_latency = self.call_latency
+        if not self.real:
+            # The fake driver releases nothing, so on a GPU node the agent's
+            # dump gate would find every fd a real rank holds. Ranks already
+            # scan a non-existent root; the agent does the same.
+            cfg.proc_root = os.path.join(self.root, "no-proc")
         self.cfg = cfg
 
         node_info = {}
@@ -71,20 +76,26 @@ class SimCluster:
             self.agents[node] = agent
             addr = f"tcp:127.0.0.1:{server.port}"
             agent.rpc_addr = addr
-            node_info[node] = {
-                "host": node,
-                "gpu_count": self.ranks_per_node,
-                "gpu_names": "|".join(["H100"] * self.ranks_per_node),
-                "gpu_uuids": "|".join(
-                    f"GPU-{index:04d}{g:04d}-0000-0000-0000-000000000000"
-                    for g in range(self.ranks_per_node)
-                ),
-                "driver_version": "610.57.04",
-                "gpu_mem_total_mib": 81920 * self.ranks_per_node,
-                "ram_headroom_mib": 2000000,
-                "criu_cuda_plugin": True,
-                "mnnvl": False,
-            }
+            if self.real:
+                # The real driver will be asked to restore with whatever map
+                # this produces, so the UUIDs have to be the node's own.
+                node_info[node] = {**agent.describe(), "host": node, "ip": "127.0.0.1"}
+            else:
+                node_info[node] = {
+                    "host": node,
+                    "ip": "127.0.0.1",
+                    "gpu_count": self.ranks_per_node,
+                    "gpu_names": "|".join(["H100"] * self.ranks_per_node),
+                    "gpu_uuids": "|".join(
+                        f"GPU-{index:04d}{g:04d}-0000-0000-0000-000000000000"
+                        for g in range(self.ranks_per_node)
+                    ),
+                    "driver_version": "610.57.04",
+                    "gpu_mem_total_mib": 81920 * self.ranks_per_node,
+                    "ram_headroom_mib": 2000000,
+                    "criu_cuda_plugin": True,
+                    "mnnvl": False,
+                }
 
         self.coord = Coordinator(
             cfg,
@@ -94,18 +105,22 @@ class SimCluster:
         )
         return self
 
-    def launch_ranks(self, dirty_ranks=(), cuda=None, gloo=False):
+    def launch_ranks(self, dirty_ranks=(), cuda=None, gloo=False, backend=None):
+        """backend: None (no process group), "gloo" (CPU), or "nccl" (real GPUs,
+        one per rank on this host)."""
         dirty = set(dirty_ranks)
         cuda = self.real if cuda is None else cuda
-        self.gloo = gloo
-        init_method = self.new_rendezvous() if gloo else None
+        backend = backend or ("gloo" if gloo else None)
+        self.gloo = backend is not None
+        self.backend = backend
+        init_method = self.new_rendezvous() if backend else None
         world = self.nodes * self.ranks_per_node
         rank_id = 0
         for index in range(self.nodes):
             node = f"node-{index}"
             addr = self.agents[node].rpc_addr
             node_control = self.agents[node].control_root
-            for _ in range(self.ranks_per_node):
+            for local in range(self.ranks_per_node):
                 progress = os.path.join(self.root, f"rank-{rank_id}.json")
                 cmd = [
                     sys.executable, FAKE_RANK,
@@ -122,8 +137,10 @@ class SimCluster:
                     cmd.append("--dirty")
                 if cuda:
                     cmd.append("--cuda")
-                if gloo:
-                    cmd += ["--gloo", "--init-method", init_method]
+                if backend:
+                    cmd += ["--backend", backend, "--init-method", init_method]
+                if backend == "nccl":
+                    cmd += ["--device", str(local)]
                 env = dict(os.environ, MNCR_LOG_LEVEL="warn", PYTHONPATH=_repo_root())
                 self.procs.append(
                     (rank_id, node, subprocess.Popen(cmd, env=env,
@@ -201,11 +218,33 @@ class SimCluster:
             time.sleep(0.05)
         return False
 
+    def last_event(self, rank, event):
+        events = [e for e in self.progress(rank).get("events", []) if e["event"] == event]
+        return events[-1] if events else None
+
     def driver_calls(self):
         return {n: list(a.driver.calls) for n, a in self.agents.items()}
 
     def alive(self):
         return sum(1 for _, _, p in self.procs if p.poll() is None)
+
+    def wait_for_exit(self, timeout=60.0):
+        """Reap every launched rank.
+
+        After a checkpoint-and-stop the ranks are dead - criu killed them -
+        but as our children they sit as zombies until waited on, and a zombie
+        still owns its pid. criu restore needs that pid back.
+        """
+        for _, _, proc in self.procs:
+            proc.wait(timeout=timeout)
+        return True
+
+    def registered_pids(self):
+        pids = set()
+        for agent in self.agents.values():
+            for record in agent.local_ranks(self.job_id):
+                pids.add(int(record["host_pid"]))
+        return pids
 
     def rank_stderr(self, rank=None):
         """Stderr of exited ranks, so a dead rank explains itself."""
@@ -222,8 +261,19 @@ class SimCluster:
 
     # -------------------------------------------------------------- teardown
     def stop(self):
+        import signal
+
+        own = {p.pid for _, _, p in self.procs}
+        # Ranks that came back through criu restore are nobody's children;
+        # the agents' registries are the only record of them.
+        for pid in self.registered_pids() - own:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
         for _, _, proc in self.procs:
-            proc.terminate()
+            if proc.poll() is None:
+                proc.terminate()
         for _, _, proc in self.procs:
             try:
                 proc.wait(timeout=5)

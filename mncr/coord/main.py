@@ -31,12 +31,22 @@ class Coordinator:
 
     # --------------------------------------------------------------- ops
     def register_agent(self, node, addr, info=None):
+        """Add a node. Without `info`, the agent is asked to describe itself."""
         self.pool.add(node, addr)
+        if info is None:
+            try:
+                info = self.pool.call(node, "describe", _timeout=60)
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warn("agent did not describe itself", node=node, error=str(exc))
+                info = None
         if info:
             self.node_info[node] = info
             self.runner.node_info[node] = info
-        _LOG.info("agent registered", node=node, addr=addr)
-        return {"registered": True, "nodes": self.pool.nodes()}
+        _LOG.info(
+            "agent registered", node=node, addr=addr,
+            ip=(info or {}).get("ip"), gpus=(info or {}).get("gpu_count"),
+        )
+        return {"registered": True, "nodes": self.pool.nodes(), "info": info or {}}
 
     def register_job(self, job_id, ranks):
         refs = [RankRef(r) for r in ranks]

@@ -55,6 +55,11 @@ class MutationTest(unittest.TestCase):
             env["CUDA_CHECKPOINT_JOB_FILE"], f"{CONTROL_PATH}/jobs/train-7.jobfile"
         )
         self.assertTrue(env["MNCR_RANK_ADDR"].startswith("unix:"))
+        # Measured on two nodes: without these three, a rank either cannot be
+        # checkpointed at all or cannot be restored anywhere else.
+        self.assertEqual(env["NCCL_RAS_ENABLE"], "0")
+        self.assertEqual(env["FI_HMEM_CUDA_USE_GDRCOPY"], "0")
+        self.assertEqual(env["LD_PRELOAD"], f"{CONTROL_PATH}/lib/libmncr_netmap.so")
 
     def test_ignores_pods_that_did_not_opt_in(self):
         response = mutate(pod(labels={}))
@@ -120,6 +125,9 @@ class MutationTest(unittest.TestCase):
                     {"name": "MNCR_CONTROL_ROOT", "value": CONTROL_PATH},
                     {"name": "MNCR_RANK_ADDR", "value": "unix:/run/mncr/agent.sock"},
                     {"name": "CUDA_CHECKPOINT_JOB_FILE", "value": "/x"},
+                    {"name": "NCCL_RAS_ENABLE", "value": "1"},
+                    {"name": "FI_HMEM_CUDA_USE_GDRCOPY", "value": "1"},
+                    {"name": "LD_PRELOAD", "value": "/my/own.so"},
                 ],
             }
         ]

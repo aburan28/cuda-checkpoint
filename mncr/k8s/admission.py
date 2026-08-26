@@ -233,6 +233,17 @@ def mutate(request, control_root=CONTROL_PATH, job_from_label=("mncr.io/job-id",
             "MNCR_CONTROL_ROOT": control_root,
             "MNCR_RANK_ADDR": f"unix:{control_root}/agent.sock",
             "CUDA_CHECKPOINT_JOB_FILE": f"{control_root}/jobs/{job_id}.jobfile",
+            # Two things measured to survive communicator teardown and fail a
+            # restore: NCCL RAS keeps listeners per process, and libfabric
+            # (aws-ofi-nccl) holds /dev/gdrdrv from plugin init on. Neither
+            # can be released from inside the rank; both are prevented here.
+            # An author who sets either keeps their value.
+            "NCCL_RAS_ENABLE": "0",
+            "FI_HMEM_CUDA_USE_GDRCOPY": "0",
+            # NCCL keeps the node address it found at first init; a rank
+            # restored on another node needs this shim to listen there. The
+            # agent publishes it into the control directory on every node.
+            "LD_PRELOAD": f"{control_root}/lib/libmncr_netmap.so",
         }
         missing = [
             {"name": name, "value": value}

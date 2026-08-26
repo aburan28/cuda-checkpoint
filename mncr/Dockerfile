@@ -41,6 +41,16 @@ LABEL org.opencontainers.image.description="mncr coordinator, controller and adm
 USER 65532:65532
 ENTRYPOINT ["python3", "-m", "k8s.controller"]
 
+# ------------------------------------------------------------- netmap
+# The bind shim ranks preload so they can be restored on another node. Built
+# here so the agent image can publish it without carrying a compiler.
+FROM base AS netmap-build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc libc6-dev make \
+ && rm -rf /var/lib/apt/lists/*
+COPY torchckpt/netmap/ ./torchckpt/netmap/
+RUN make -C torchckpt/netmap libmncr_netmap.so
+
 # ----------------------------------------------------------------- agent
 FROM base AS agent
 ARG TARGETARCH=amd64
@@ -48,6 +58,7 @@ ARG BUILD_CRIU=0
 RUN apt-get update \
  && apt-get install -y --no-install-recommends criu libcap2-bin \
  && rm -rf /var/lib/apt/lists/*
+COPY --from=netmap-build /opt/mncr/torchckpt/netmap/libmncr_netmap.so ./torchckpt/netmap/libmncr_netmap.so
 
 # Optional: criu from source, for distros whose package omits the CUDA plugin.
 RUN if [ "$BUILD_CRIU" = "1" ]; then \

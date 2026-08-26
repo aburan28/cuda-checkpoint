@@ -61,8 +61,13 @@ class _Runtime:
         self.proc_root = "/proc"
         self.pending = None          # {"epoch_id":..., "target_step":...}
         self.initialized = False
+        self.started_at = time.time()
         self.last_report = {}
+        self.last_rebuild = {}
         self.had_process_group = False
+        # Whether ranks agree over the communicator, every step, on whether an
+        # epoch has been requested. See safe_point().
+        self.coupled_polling = True
 
     # ------------------------------------------------------------- lifecycle
     def init(
@@ -127,12 +132,42 @@ class _Runtime:
 
     # ------------------------------------------------------------ safe point
     def safe_point(self):
-        """Service any pending epoch, then return so the caller can do a step."""
+        """Service any pending epoch, then return so the caller can do a step.
+
+        The request is a file, written by each node's agent, and it lands on
+        different nodes at different moments. Two ranks that notice it one
+        step apart would issue their agreement collective one step apart -
+        and NCCL matches collectives by order, so rank A's agreement would
+        pair with rank B's training all-reduce. So when a communicator is
+        live, the ranks first agree over it, every step, on whether anyone
+        has seen a request. That collective sits at the same position in
+        every rank's stream, which is what keeps everything after it aligned.
+        """
         self._require_init()
         step = self.status.step
 
         if self.pending is None:
-            request = self.control.poll_request()
+            request = self._fresh(self.control.poll_request())
+            if self.coupled_polling and torch_backend.distributed_ready():
+                mine = _epoch_int(request["epoch_id"]) if request else 0
+                seen, lookahead = torch_backend.agree_on_request(
+                    mine, int(request.get("lookahead", 1)) if request else 0
+                )
+                if seen and not request:
+                    # A peer has the request and this node's copy is still on
+                    # its way. Wait briefly for the file itself; failing that,
+                    # the collective carried enough to act on. Either way this
+                    # rank enters the epoch at the same step as everyone else.
+                    request = self._fresh(
+                        self.control.wait_for_request(timeout=float(self.cfg.request_settle))
+                    )
+                    if request is None:
+                        request = self._synthesize(seen, lookahead)
+                elif seen and request and mine != seen:
+                    _LOG.warn(
+                        "peers are acting on a different epoch",
+                        mine=request["epoch_id"], theirs=_epoch_id(seen),
+                    )
             if request and request.get("action") == "checkpoint":
                 self._begin(request)
 
@@ -140,6 +175,39 @@ class _Runtime:
             self._service()
 
         self.status.advance_step()
+
+    def _fresh(self, request):
+        """Drop a request issued before this process started.
+
+        A request file outlives the epoch that wrote it when that epoch
+        failed past the commit point: nobody is left to clear it. A rank
+        launched afterwards must not mistake it for its own.
+        """
+        if request is None:
+            return None
+        issued = float(request.get("issued_at") or 0)
+        if issued and issued < self.started_at:
+            _LOG.warn(
+                "ignoring a request issued before this rank started",
+                epoch=request.get("epoch_id"), issued_at=issued,
+            )
+            return None
+        return request
+
+    def _synthesize(self, seen, lookahead):
+        if seen <= 1:
+            _LOG.error("peers saw an epoch request this node never received")
+            return None
+        epoch_id = _epoch_id(seen)
+        self.control.mark_serviced(epoch_id)
+        _LOG.warn("request taken from peers; the file never arrived", epoch=epoch_id)
+        return {
+            "epoch_id": epoch_id,
+            "action": "checkpoint",
+            "lookahead": max(1, int(lookahead)),
+            "wait_timeout": float(self.cfg.checkpoint_timeout),
+            "synthesized": True,
+        }
 
     def _begin(self, request):
         epoch_id = request.get("epoch_id")
@@ -240,7 +308,7 @@ class _Runtime:
         self.rank, self.world_size = ctx.rank, ctx.world_size
 
         if self.auto_teardown and self.had_process_group:
-            torch_backend.default_rebuild(ctx)
+            self.last_rebuild = torch_backend.default_rebuild(ctx)
         for name, hook in self.resume_hooks:
             hook(ctx)
         if graphs.REGISTRY.names():
@@ -261,6 +329,28 @@ class _Runtime:
                 _LOG.warn("re-registration failed", error=str(exc))
 
         self.status.enter(RankState.RUNNING, epoch=epoch_id)
+
+
+def _epoch_int(epoch_id):
+    """An epoch id as an integer that survives an int64 all_reduce.
+
+    Ids are "ep-" plus twelve hex digits (mncr.proto.new_id), 48 bits. Anything
+    else collapses to 1: still "somebody has a request", but not recoverable
+    from the collective, so a rank without the file has to wait for it.
+    """
+    text = str(epoch_id or "")
+    if text.startswith("ep-"):
+        try:
+            value = int(text[3:], 16)
+            if 1 < value < (1 << 62):
+                return value
+        except ValueError:
+            pass
+    return 1
+
+
+def _epoch_id(value):
+    return f"ep-{int(value):012x}"
 
 
 _RT = _Runtime()

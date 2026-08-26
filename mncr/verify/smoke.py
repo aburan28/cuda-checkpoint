@@ -13,9 +13,15 @@ one's precondition.
                       verification gates and pid handling are exercised
     4  + coordinator  a full epoch: prepare, vote, lock, checkpoint, dump,
                       restore, resume, across real ranks
+    5  + NCCL         the same epoch with ranks in a real NCCL process group,
+                      one GPU each: the communicator is torn down before the
+                      lock and rebuilt after, and proven working again
+    6  + restore      checkpoint-and-stop, then bring the ranks back from
+                      their images: the processes actually die and return
 
-Nothing here is simulated. If a level cannot run - no GPU, no criu, not root -
-it says so and returns a skip rather than a pass.
+Nothing here is simulated. If a level cannot run - no GPU, no criu, not root,
+one GPU where NCCL needs two - it says so and returns a skip rather than a
+pass. For more than one node see verify/cluster.py.
 """
 
 import argparse
@@ -354,11 +360,121 @@ def level4_epoch(cfg, workdir, ranks=2):
         sim.stop()
 
 
+def _torch_gpus():
+    try:
+        import torch
+
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+def _assert_resumed(sim, ranks, restored=None, need_group=False):
+    for rank in range(ranks):
+        event = sim.last_event(rank, "resumed")
+        assert event, f"rank {rank} never resumed; stderr: {sim.rank_stderr(rank)}"
+        assert event.get("device_memory_intact") is True, (
+            f"rank {rank} device memory did not survive: {event}"
+        )
+        if restored is not None:
+            assert bool(event.get("restored")) is restored, (
+                f"rank {rank} resumed with restored={event.get('restored')}, "
+                f"expected {restored}"
+            )
+        if need_group:
+            assert event.get("rejoined") is True, (
+                f"rank {rank}: the rebuilt process group did not produce a "
+                f"correct collective: {event}"
+            )
+            rebuild = event.get("rebuild") or {}
+            assert rebuild.get("warm_up") is True, f"rank {rank}: {rebuild}"
+    quiesced = {sim.last_event(r, "quiesced")["step"] for r in range(ranks)}
+    assert len(quiesced) == 1, f"ranks stopped at different steps: {quiesced}"
+
+
+def level5_nccl(cfg, workdir):
+    """Real NCCL: torn down before the lock, rebuilt after, proven by all_reduce."""
+    from verify.sim import SimCluster
+
+    if os.geteuid() != 0:
+        raise Skip("the agent needs root")
+    gpus = _torch_gpus()
+    if gpus == 0:
+        raise Skip("needs torch with a CUDA device")
+    if gpus < 2:
+        raise Skip(f"NCCL needs a device per rank; this node has {gpus}. "
+                   f"Use verify/cluster.py across nodes.")
+
+    sim = SimCluster(nodes=1, ranks_per_node=gpus, step_seconds=0.02, real=True)
+    sim.start()
+    try:
+        sim.launch_ranks(backend="nccl")
+        sim.wait_registered(timeout=180)
+        result = sim.coord.checkpoint(sim.job_id, mode="continue")
+        assert sim.wait_for_event("resumed", timeout=300), (
+            f"ranks did not resume: {sim.rank_stderr()}"
+        )
+        _assert_resumed(sim, gpus, restored=False, need_group=True)
+        teardown = sim.last_event(0, "resumed").get("teardown") or {}
+        return {
+            "epoch_id": result["epoch_id"],
+            "ranks": gpus,
+            "seconds": result.get("seconds"),
+            "nccl": sim.progress(0).get("nccl_version"),
+            "sockets_after_teardown": teardown.get("open_sockets"),
+        }
+    finally:
+        sim.stop()
+
+
+def level6_restore(cfg, workdir):
+    """Checkpoint-and-stop, then restore from the images. The ranks really die."""
+    from verify.sim import SimCluster
+
+    if os.geteuid() != 0:
+        raise Skip("the agent needs root")
+    try:
+        import ctypes
+
+        ctypes.CDLL("libcuda.so.1").cuInit(0)
+    except OSError:
+        raise Skip("level 6 ranks need a CUDA driver")
+    gpus = _torch_gpus()
+    backend = "nccl" if gpus >= 2 else None
+    ranks = max(1, gpus) if backend else 1
+
+    sim = SimCluster(nodes=1, ranks_per_node=ranks, step_seconds=0.02, real=True)
+    sim.start()
+    try:
+        sim.launch_ranks(backend=backend)
+        sim.wait_registered(timeout=180)
+        result = sim.coord.checkpoint(sim.job_id, mode="stop")
+        # criu killed them; reap so the pids are free for the restore.
+        sim.wait_for_exit(timeout=60)
+        restored = sim.coord.restore(sim.job_id, result["epoch_id"])
+        assert sim.wait_for_event("resumed", timeout=300), (
+            f"ranks did not come back: {sim.rank_stderr()}"
+        )
+        _assert_resumed(sim, ranks, restored=True, need_group=bool(backend))
+        new_pids = sim.registered_pids()
+        return {
+            "epoch_id": result["epoch_id"],
+            "ranks": ranks,
+            "backend": backend,
+            "device_maps": restored.get("device_maps"),
+            "restored_pids": sorted(new_pids),
+        }
+    finally:
+        sim.stop()
+
+
 LEVELS = {
     1: ("driver only", level1_driver),
     2: ("driver + criu", level2_criu),
     3: ("through the agent", level3_agent),
     4: ("full epoch", level4_epoch),
+    5: ("nccl epoch", level5_nccl),
+    6: ("stop and restore", level6_restore),
 }
 
 
