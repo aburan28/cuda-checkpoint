@@ -113,7 +113,8 @@ class RankRef(dict):
     """Identity of one rank, as the coordinator and agent both see it."""
 
     @staticmethod
-    def make(job_id, rank, node, pod=None, container=None, host_pid=None, gpu_uuids=None):
+    def make(job_id, rank, node, pod=None, container=None, host_pid=None, gpu_uuids=None,
+             ip=None):
         return RankRef(
             job_id=job_id,
             rank=int(rank),
@@ -122,6 +123,10 @@ class RankRef(dict):
             container=container,
             host_pid=host_pid,
             gpu_uuids=list(gpu_uuids or []),
+            # Where the rank itself can be reached - its pod address when
+            # ranks are not on the host network. The rendezvous for a rebuild
+            # is built on rank 0's, since a peer has to connect to it.
+            ip=ip,
         )
 
     @property

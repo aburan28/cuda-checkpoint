@@ -43,13 +43,14 @@ _LOG = log.get("agent")
 
 class RankRecord(dict):
     @staticmethod
-    def make(job_id, rank, host_pid, world_size, gpu_uuids):
+    def make(job_id, rank, host_pid, world_size, gpu_uuids, ip=None):
         return RankRecord(
             job_id=job_id,
             rank=int(rank),
             host_pid=int(host_pid),
             world_size=int(world_size),
             gpu_uuids=list(gpu_uuids or []),
+            ip=ip,
             registered_at=time.time(),
         )
 
@@ -184,9 +185,9 @@ class Agent:
             raise PreconditionError(f"cannot map rank pid {reported} to a host pid: {exc}")
 
     def rank_register(self, job_id, rank, host_pid, world_size, gpu_uuids=None,
-                      peer_pid=None):
+                      peer_pid=None, ip=None):
         host_pid, how = self._host_pid(host_pid, peer_pid)
-        record = RankRecord.make(job_id, rank, host_pid, world_size, gpu_uuids)
+        record = RankRecord.make(job_id, rank, host_pid, world_size, gpu_uuids, ip=ip)
         with self._lock:
             self._ranks[(job_id, int(rank))] = record
         # The fake backend has no way to discover CUDA processes, so a
@@ -506,6 +507,12 @@ class Agent:
                 pid = record["host_pid"]
             self._finish_restore(pid, effective_map)
             restored.append(pid)
+
+        if from_images:
+            # No rank of this job is alive on this node during a restore from
+            # images, so any request file here predates the dump. A restored
+            # rank, whose own start time also predates it, would service it.
+            ControlDir(self.control_root, job_id).clear()
 
         self._release(
             job_id,

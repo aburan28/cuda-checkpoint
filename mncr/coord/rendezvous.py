@@ -41,7 +41,10 @@ class Rendezvous:
         if not ranks:
             return None
         lowest = min(ranks, key=lambda r: int(r["rank"]))
-        host = self.host_for(lowest["node"])
+        # The rank's own address first: on pod networking that is the pod
+        # IP, which is what a peer can actually connect to. The node's
+        # address is the host-network case.
+        host = lowest.get("ip") or self.host_for(lowest["node"])
         if not host:
             return None
         port = self.port_base + (self._seq % self.port_span)

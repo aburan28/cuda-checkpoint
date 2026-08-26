@@ -9,8 +9,9 @@ not things anyone should type.
 
 import os
 import shutil
-import socket
 import subprocess
+
+from mncr.netutil import primary_ip as _primary_ip
 
 
 def _nvidia_smi(query, timeout=30):
@@ -31,23 +32,8 @@ def _nvidia_smi(query, timeout=30):
 
 
 def primary_ip():
-    """The address other nodes reach this one at.
-
-    MNCR_NODE_IP wins, for hosts with several interfaces where the routing
-    default is not the fabric the job uses. Otherwise: the source address the
-    kernel would pick for an outbound packet, which needs no packet sent.
-    """
-    override = os.environ.get("MNCR_NODE_IP")
-    if override:
-        return override
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        probe.connect(("10.255.255.255", 1))
-        return probe.getsockname()[0]
-    except OSError:
-        return None
-    finally:
-        probe.close()
+    """The address other nodes reach this one at; MNCR_NODE_IP overrides."""
+    return _primary_ip("MNCR_NODE_IP")
 
 
 def mem_available_mib():

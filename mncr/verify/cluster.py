@@ -266,6 +266,13 @@ class Cluster:
                 )
                 env["MNCR_NETMAP_DEBUG"] = "1"
             node.sh(f"pkill -f '[f]ake_rank.py' ; true")
+            # A rank writes its progress fresh; a file from an earlier run on
+            # this node would otherwise be read as this run's.
+            node.sh(
+                "rm -f " + " ".join(
+                    shlex.quote(self.progress_path(r)) for r in range(self.world)
+                ) + " ; true"
+            )
             for local in range(self.args.ranks_per_node):
                 cmd = (
                     f"cd {shlex.quote(node.repo)} && {env_prefix(env)} {node.python} "
@@ -289,7 +296,9 @@ class Cluster:
             for node in self.nodes:
                 status = self.call(node.name, "status", job_id=self.job)
                 for record in status.get("ranks", []):
-                    registered[int(record["rank"])] = (node.name, int(record["host_pid"]))
+                    registered[int(record["rank"])] = (
+                        node.name, int(record["host_pid"]), record.get("ip")
+                    )
             if len(registered) >= self.world:
                 break
             if time.monotonic() > deadline:
@@ -299,8 +308,8 @@ class Cluster:
                 )
             time.sleep(0.5)
         refs = [
-            RankRef.make(self.job, r, node, host_pid=pid)
-            for r, (node, pid) in sorted(registered.items())
+            RankRef.make(self.job, r, node, host_pid=pid, ip=ip)
+            for r, (node, pid, ip) in sorted(registered.items())
         ]
         self.coord.register_job(self.job, refs)
         self.wait_steps(5, timeout=120)

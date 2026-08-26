@@ -82,18 +82,10 @@ class Coordinator:
             raise KeyError(f"unknown epoch {epoch_id}")
 
         if targets:
-            ranks, device_maps = self._replace_placement(source, targets)
+            ranks = self._replace_placement(source, targets)
         else:
             ranks = [RankRef(r) for r in source["ranks"]]
-            device_maps = {
-                node: to_cli(
-                    build_pairs(
-                        self._node_uuids(node), self._node_uuids(node)
-                    )
-                )
-                for node in {r["node"] for r in ranks}
-                if self._node_uuids(node)
-            }
+        device_maps = self._maps_for(source, ranks)
 
         epoch = self.runner.restore(
             job_id, epoch_id, ranks, image_root=image_root,
@@ -109,20 +101,43 @@ class Coordinator:
         return [u for u in str(raw).split("|") if u]
 
     def _replace_placement(self, source, targets):
-        """Re-place ranks onto new nodes and build each node's device map."""
-        source_nodes = source.get("ranks", [])
-        by_rank = {int(r["rank"]): r for r in source_nodes}
-        ranks, device_maps = [], {}
+        """Re-place ranks onto new nodes."""
+        by_rank = {int(r["rank"]): r for r in source.get("ranks", [])}
+        ranks = []
         for node, rank_ids in targets.items():
-            src_node = by_rank[int(rank_ids[0])]["node"] if rank_ids else None
-            src_uuids = self._node_uuids(src_node) if src_node else []
-            dst_uuids = self._node_uuids(node)
-            if src_uuids and dst_uuids:
-                device_maps[node] = to_cli(build_pairs(src_uuids, dst_uuids))
             for rank_id in rank_ids:
                 original = by_rank[int(rank_id)]
                 ranks.append(RankRef({**original, "node": node}))
-        return ranks, device_maps
+        return ranks
+
+    def _maps_for(self, source, ranks):
+        """One device map per target node: the image's GPUs onto the node's.
+
+        The image's GPUs are those of the node that dumped it, which
+        `dumped_on` records and a later restore does not change. A node
+        restoring an image it dumped itself gets an identity map; one
+        restoring somebody else's gets the real thing - whether this is the
+        first restore of the epoch or the third.
+        """
+        dumped = {int(k): v for k, v in (source.get("dumped_on") or {}).items()}
+        fallback = {int(r["rank"]): r["node"] for r in source.get("ranks", [])}
+        maps = {}
+        for node in {r["node"] for r in ranks}:
+            here = sorted(int(r["rank"]) for r in ranks if r["node"] == node)
+            origins = sorted({dumped.get(rank) or fallback.get(rank) for rank in here} - {None})
+            if len(origins) > 1:
+                # The agent applies one map to every rank it restores; ranks
+                # dumped on different nodes would each need their own.
+                _LOG.warn(
+                    "ranks placed on one node were dumped on several; using the "
+                    "first one's map for all",
+                    node=node, origins=origins,
+                )
+            src_uuids = self._node_uuids(origins[0]) if origins else []
+            dst_uuids = self._node_uuids(node)
+            if src_uuids and dst_uuids:
+                maps[node] = to_cli(build_pairs(src_uuids, dst_uuids))
+        return maps
 
     def plan_restore(self, epoch_id, node_count, allow_mnnvl=None):
         """Which nodes could host this image, and why the rest cannot."""

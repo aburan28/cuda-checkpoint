@@ -186,5 +186,62 @@ class PartialMigrationTest(unittest.TestCase):
         self.assertEqual(len(self.sim.agents["node-0"].criu.restores), 3)
 
 
+
+class RepeatedRestoreTest(unittest.TestCase):
+    """Sources and device maps come from where the image was dumped, not
+    from where the last restore put the ranks."""
+
+    def setUp(self):
+        self.sim = SimCluster(nodes=2, ranks_per_node=2, step_seconds=0.002).start()
+        self.sim.launch_ranks()
+        self.sim.wait_registered()
+
+    def tearDown(self):
+        self.sim.stop()
+
+    def _restore_args(self, epoch_id, **kwargs):
+        seen = {}
+        real = self.sim.coord.pool.fanout
+
+        def spy(nodes, op, per_node_args=None, **common):
+            if op == "restore":
+                seen.update(per_node_args or {})
+            return real(nodes, op, per_node_args=per_node_args, **common)
+
+        self.sim.coord.pool.fanout = spy
+        try:
+            result = self.sim.coord.restore(self.sim.job_id, epoch_id, **kwargs)
+        finally:
+            self.sim.coord.pool.fanout = real
+        return result, seen
+
+    def test_a_second_migration_still_fetches_from_the_dumping_node(self):
+        epoch_id = self.sim.coord.checkpoint(self.sim.job_id, mode="stop")["epoch_id"]
+        dumped = self.sim.coord.store.get(epoch_id)["dumped_on"]
+        self.assertEqual(dumped, {"0": "node-0", "1": "node-0", "2": "node-1", "3": "node-1"})
+
+        swap = {"node-0": [2, 3], "node-1": [0, 1]}
+        self._restore_args(epoch_id, targets=swap)
+        # and back again: the sources must name the original dump nodes
+        back = {"node-0": [0, 1], "node-1": [2, 3]}
+        result, args = self._restore_args(epoch_id, targets=back)
+        self.assertEqual(args["node-0"]["sources"], {0: "node-0", 1: "node-0"})
+        self.assertEqual(args["node-1"]["sources"], {2: "node-1", 3: "node-1"})
+        # ...and restoring onto the dumping node is an identity map, which
+        # the agent then does not hand to criu.
+        for node, cli in result["device_maps"].items():
+            self.assertTrue(is_identity_cli(cli), f"{node}: {cli}")
+
+    def test_restoring_where_the_ranks_are_after_a_move_maps_from_the_dump(self):
+        epoch_id = self.sim.coord.checkpoint(self.sim.job_id, mode="stop")["epoch_id"]
+        self._restore_args(epoch_id, targets={"node-0": [2, 3], "node-1": [0, 1]})
+        # "where it ran" is now the swapped placement; the image's GPUs are
+        # still the original node's, so the map must not be identity.
+        result, args = self._restore_args(epoch_id)
+        for node, cli in result["device_maps"].items():
+            self.assertFalse(is_identity_cli(cli), f"{node}: {cli}")
+        self.assertEqual(args["node-0"]["sources"], {2: "node-1", 3: "node-1"})
+
+
 if __name__ == "__main__":
     unittest.main()

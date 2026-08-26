@@ -141,7 +141,8 @@ class SimCluster:
                     cmd += ["--backend", backend, "--init-method", init_method]
                 if backend == "nccl":
                     cmd += ["--device", str(local)]
-                env = dict(os.environ, MNCR_LOG_LEVEL="warn", PYTHONPATH=_repo_root())
+                env = dict(os.environ, MNCR_LOG_LEVEL="warn", PYTHONPATH=_repo_root(),
+                           MNCR_RANK_IP="127.0.0.1")
                 self.procs.append(
                     (rank_id, node, subprocess.Popen(cmd, env=env,
                                                      stdout=subprocess.DEVNULL,
@@ -170,7 +171,8 @@ class SimCluster:
             for record in agent.local_ranks(self.job_id):
                 refs.append(
                     RankRef.make(
-                        self.job_id, record["rank"], node, host_pid=record["host_pid"]
+                        self.job_id, record["rank"], node, host_pid=record["host_pid"],
+                        ip=record.get("ip"),
                     )
                 )
         return sorted(refs, key=lambda r: r["rank"])

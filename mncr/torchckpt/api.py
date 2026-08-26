@@ -19,7 +19,7 @@ import dataclasses
 import os
 import time
 
-from mncr import config, log
+from mncr import config, log, netutil
 from mncr.errors import PreconditionError, TimeoutError_
 from mncr.proto import Vote
 
@@ -111,6 +111,7 @@ class _Runtime:
                     os.getpid(),
                     self.world_size,
                     torch_backend.local_gpu_uuids(),
+                    ip=netutil.primary_ip("MNCR_RANK_IP", "MNCR_NODE_IP"),
                 )
             except Exception as exc:
                 # Registration is best-effort at startup: the agent may come up
@@ -196,6 +197,10 @@ class _Runtime:
 
     def _synthesize(self, seen, lookahead):
         if seen <= 1:
+            # The id could not travel in the collective (not an "ep-<hex>"
+            # id), and the file never came. This rank sits the epoch out; its
+            # peers quiesce, miss its vote, and the coordinator aborts before
+            # the lock. Costly but safe.
             _LOG.error("peers saw an epoch request this node never received")
             return None
         epoch_id = _epoch_id(seen)
@@ -292,6 +297,11 @@ class _Runtime:
 
     def _resume(self, token, epoch_id):
         self.status.enter(RankState.RESUMING, epoch=epoch_id)
+        # Anything issued before the token that released this rank belongs
+        # to an epoch that is over. A process restored from an image carries
+        # its original started_at, so that alone would not catch a request
+        # file the epoch that dumped it left behind.
+        self.started_at = max(self.started_at, float(token.get("at") or 0))
         ctx = ResumeContext(
             epoch_id=epoch_id,
             rank=int(token.get("rank", self.rank)),
@@ -315,8 +325,9 @@ class _Runtime:
             graphs.REGISTRY.recapture_all()
 
         if ctx.restored:
-            # A restored process may have a different host pid and a different
-            # agent; re-announce before anything else can go wrong.
+            # A restored process may have a different host pid, a different
+            # address and a different agent; re-announce before anything else
+            # can go wrong.
             try:
                 self.agent.register(
                     self.job_id,
@@ -324,6 +335,7 @@ class _Runtime:
                     os.getpid(),
                     self.world_size,
                     torch_backend.local_gpu_uuids(),
+                    ip=netutil.primary_ip("MNCR_RANK_IP", "MNCR_NODE_IP"),
                 )
             except Exception as exc:
                 _LOG.warn("re-registration failed", error=str(exc))

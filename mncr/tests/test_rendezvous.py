@@ -19,6 +19,12 @@ class RendezvousTest(unittest.TestCase):
         addr = rendezvous.new(_ranks((1, "a"), (0, "b")))
         self.assertTrue(addr.startswith("tcp://10.0.0.2:"), addr)
 
+    def test_the_ranks_own_address_wins_over_the_nodes(self):
+        info = {"a": {"ip": "10.0.0.1"}}
+        rendezvous = Rendezvous(info)
+        ranks = [RankRef.make("job", 0, "a", ip="10.244.1.7"), RankRef.make("job", 1, "a")]
+        self.assertTrue(rendezvous.new(ranks).startswith("tcp://10.244.1.7:"))
+
     def test_ports_rotate(self):
         rendezvous = Rendezvous({"a": {"ip": "10.0.0.1"}}, port_base=1000, port_span=3)
         ports = {int(rendezvous.new(_ranks((0, "a"))).rsplit(":", 1)[1]) for _ in range(3)}

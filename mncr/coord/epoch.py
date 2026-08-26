@@ -256,6 +256,9 @@ class EpochRunner:
                 images.append({**image, "node": node})
         epoch["image_id"] = epoch["epoch_id"]
         epoch["images"] = images
+        # Where each rank's image was written. `ranks` is rewritten by every
+        # restore to say where the ranks are now; this is not.
+        epoch["dumped_on"] = {str(i["rank"]): i["node"] for i in images}
         self._save(epoch, Phase.DUMPED, note=f"{len(images)} images")
 
         requirements = self._requirements_for(nodes)
@@ -314,6 +317,11 @@ class EpochRunner:
         stored = self.store.get(epoch_id)
         epoch = Epoch(stored or Epoch.make(job_id, ranks, reason="restore"))
         previous = {int(r["rank"]): r["node"] for r in epoch.get("ranks", [])}
+        # A second restore of the same epoch must fetch from where the image
+        # was dumped, not from where the first restore put the ranks.
+        dumped_on = {
+            int(k): v for k, v in (epoch.get("dumped_on") or {}).items()
+        } or previous
         epoch["ranks"] = [dict(r) for r in ranks]
         epoch["phase"] = Phase.DUMPED.value
         # A fresh mark, so the RESTORING transition measures the restore and
@@ -337,9 +345,9 @@ class EpochRunner:
                 # Where each rank's image was written, so a node that never
                 # saw it can find the manifest in the store.
                 "sources": {
-                    int(r["rank"]): previous.get(int(r["rank"]))
+                    int(r["rank"]): dumped_on.get(int(r["rank"]))
                     for r in epoch.ranks_on(node)
-                    if previous.get(int(r["rank"]))
+                    if dumped_on.get(int(r["rank"]))
                 },
             }
             for node in epoch.nodes()

@@ -180,7 +180,7 @@ class AgentClient:
             _LOG.error("vote failed", rank=rank, epoch=epoch_id, error=str(exc))
             raise
 
-    def register(self, job_id, rank, host_pid, world_size, gpu_uuids):
+    def register(self, job_id, rank, host_pid, world_size, gpu_uuids, ip=None):
         with rpc.Client(self.addr, timeout=self.timeout) as client:
             return client.call(
                 "rank_register",
@@ -189,4 +189,5 @@ class AgentClient:
                 host_pid=host_pid,
                 world_size=world_size,
                 gpu_uuids=gpu_uuids,
+                ip=ip,
             )
