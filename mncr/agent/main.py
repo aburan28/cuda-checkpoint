@@ -25,6 +25,7 @@ from mncr import config, log, metrics, rpc
 from mncr.errors import DriverError, PreconditionError
 from mncr.proto import Vote
 from torchckpt.channel import ControlDir
+from coord.devicemap import is_identity_cli
 
 from imagestore.backends import LocalBackend, RemoteBackend, TieredBackend
 from imagestore.manifest import Manifest
@@ -32,6 +33,7 @@ from imagestore.pipeline import Pipeline
 
 from . import criu as criu_mod
 from . import driver as driver_mod
+from . import nodeinfo
 from .jobfile import JobFiles
 from .pids import PidResolver
 from .verify import Verifier
@@ -41,13 +43,14 @@ _LOG = log.get("agent")
 
 class RankRecord(dict):
     @staticmethod
-    def make(job_id, rank, host_pid, world_size, gpu_uuids):
+    def make(job_id, rank, host_pid, world_size, gpu_uuids, ip=None):
         return RankRecord(
             job_id=job_id,
             rank=int(rank),
             host_pid=int(host_pid),
             world_size=int(world_size),
             gpu_uuids=list(gpu_uuids or []),
+            ip=ip,
             registered_at=time.time(),
         )
 
@@ -61,8 +64,12 @@ class Agent:
         self.criu = criu_mod.make(self.cfg)
         self.jobfiles = JobFiles(self.cfg.jobfile_dir, self.cfg.cuda_checkpoint, self.cfg.fake)
         self.pids = PidResolver()
-        self.verifier = Verifier(strict=self.cfg.strict_clean)
+        self.verifier = Verifier(
+            proc_root=getattr(self.cfg, "proc_root", "/proc"), strict=self.cfg.strict_clean
+        )
         self._pipeline = None
+
+        self._publish_netmap()
 
         self._lock = threading.Lock()
         self._ranks = {}      # (job_id, rank) -> RankRecord
@@ -102,8 +109,62 @@ class Agent:
             scratch=self.cfg.cache_dir,
         )
 
-    def _manifest_path(self, image_root, epoch_id):
-        return os.path.join(image_root, epoch_id, f"manifest-{self.node}.json")
+    def _publish_netmap(self):
+        """Put the bind shim where rank pods can preload it.
+
+        <control root>/lib/libmncr_netmap.so, the path the admission webhook
+        injects as LD_PRELOAD. Same bytes and mode on every node, since a
+        migrated rank maps it and criu compares. Silent when the shim was not
+        built into this image: a rank that never moves does not need it.
+        """
+        source = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "torchckpt", "netmap", "libmncr_netmap.so",
+        )
+        if not os.path.exists(source):
+            return None
+        dest_dir = os.path.join(self.control_root, "lib")
+        dest = os.path.join(dest_dir, "libmncr_netmap.so")
+        try:
+            with open(source, "rb") as fh:
+                payload = fh.read()
+            try:
+                with open(dest, "rb") as fh:
+                    if fh.read() == payload and (os.stat(dest).st_mode & 0o777) == 0o755:
+                        return dest
+            except OSError:
+                pass
+            os.makedirs(dest_dir, exist_ok=True)
+            tmp = f"{dest}.tmp"
+            with open(tmp, "wb") as fh:
+                fh.write(payload)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, dest)
+            _LOG.info("netmap shim published", path=dest)
+            return dest
+        except OSError as exc:
+            _LOG.warn("netmap shim not published", error=str(exc))
+            return None
+
+    def _manifest_path(self, image_root, epoch_id, node=None):
+        return os.path.join(image_root, epoch_id, f"manifest-{node or self.node}.json")
+
+    def _manifest_key(self, epoch_id, node=None):
+        """Where the manifest lives in the store, beside its shards."""
+        return f"{epoch_id}/manifest-{node or self.node}.json"
+
+    # ------------------------------------------------------------- identity
+    def describe(self):
+        """This node, in the terms placement and rendezvous use.
+
+        The coordinator calls it on registration, so the two facts a restore
+        depends on - the GPU UUIDs and the address rank 0 is reachable at -
+        come from the node itself rather than from somebody's config.
+        """
+        info = nodeinfo.describe(self.node, self.cfg)
+        info["agent_addr"] = getattr(self, "rpc_addr", None)
+        info["fake"] = bool(self.cfg.fake)
+        return info
 
     # ------------------------------------------------------------- inbound
     def _host_pid(self, reported, peer_pid):
@@ -124,9 +185,9 @@ class Agent:
             raise PreconditionError(f"cannot map rank pid {reported} to a host pid: {exc}")
 
     def rank_register(self, job_id, rank, host_pid, world_size, gpu_uuids=None,
-                      peer_pid=None):
+                      peer_pid=None, ip=None):
         host_pid, how = self._host_pid(host_pid, peer_pid)
-        record = RankRecord.make(job_id, rank, host_pid, world_size, gpu_uuids)
+        record = RankRecord.make(job_id, rank, host_pid, world_size, gpu_uuids, ip=ip)
         with self._lock:
             self._ranks[(job_id, int(rank))] = record
         # The fake backend has no way to discover CUDA processes, so a
@@ -375,6 +436,19 @@ class Agent:
                 world_size=len(entries),
             )
             manifest_path = manifest.save(self._manifest_path(image_root, epoch_id))
+            # The manifest travels with the shards. Each node writes its own,
+            # to its own disk; a node restoring a rank that migrated in has
+            # never seen that disk, and the store is the only place it can
+            # look. Best effort: the dump has already succeeded, and a local
+            # restore does not need this copy.
+            try:
+                self.pipeline.backend.put(manifest_path, self._manifest_key(epoch_id))
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warn(
+                    "manifest not stored; a cross-node restore of this epoch "
+                    "will need a shared image root",
+                    epoch=epoch_id, error=str(exc),
+                )
             metrics.IMAGE_SECONDS.observe(
                 time.time() - store_started, node=self.node
             )
@@ -400,28 +474,45 @@ class Agent:
 
     # --------------------------------------------------------------- restore
     def restore(self, job_id, epoch_id, image_root, ranks=None, device_map=None,
-                init_method=None, from_images=True, world_size=None, backend=None):
+                init_method=None, from_images=True, world_size=None, backend=None,
+                sources=None):
         """Restore, unlock, and release the ranks - in checkpoint order.
 
         The vendor's r610 demo is explicit that processes must be restored and
         unlocked in the same order they were checkpointed, so local_ranks()
         returning a stable sort is a correctness property, not a tidiness one.
+
+        sources maps rank -> the node that dumped it, so a rank arriving from
+        elsewhere can be found in the store. device_map is applied inside criu
+        restore when it moves anything (see agent/criu.py); an identity map is
+        dropped before it reaches the driver, because on the image's own
+        hardware it says nothing and can only be wrong.
         """
         local = self._restore_targets(job_id, ranks, from_images)
+        sources = {int(k): v for k, v in (sources or {}).items()}
+        moving = bool(device_map) and not is_identity_cli(device_map)
+        effective_map = device_map if moving else None
         restored = []
         for record in local:
             if from_images:
                 images_dir = self._materialize(
-                    job_id, epoch_id, image_root, record["rank"]
+                    job_id, epoch_id, image_root, record["rank"],
+                    source=sources.get(int(record["rank"])),
                 )
                 # criu reports the pid it created. On a node that did not take
                 # the checkpoint this is the only source for it.
-                pid = self.criu.restore(images_dir)
+                pid = self.criu.restore(images_dir, device_map=effective_map)
                 self._adopt(job_id, record, pid)
             else:
                 pid = record["host_pid"]
-            self._finish_restore(pid, device_map)
+            self._finish_restore(pid, effective_map)
             restored.append(pid)
+
+        if from_images:
+            # No rank of this job is alive on this node during a restore from
+            # images, so any request file here predates the dump. A restored
+            # rank, whose own start time also predates it, would service it.
+            ControlDir(self.control_root, job_id).clear()
 
         self._release(
             job_id,
@@ -471,7 +562,7 @@ class Agent:
         _LOG.info("aborted", job=job_id, epoch=epoch_id, unlocked=len(locked))
         return {"node": self.node, "unlocked": locked}
 
-    def _materialize(self, job_id, epoch_id, image_root, rank):
+    def _materialize(self, job_id, epoch_id, image_root, rank, source=None):
         """Ensure this rank's image is on local disk, fetching it if not.
 
         On the node that took the checkpoint the directory is already there. On
@@ -482,27 +573,37 @@ class Agent:
         if os.path.isdir(images_dir) and os.listdir(images_dir):
             return images_dir
 
-        manifest = self._find_manifest(image_root, epoch_id, rank)
+        manifest = self._find_manifest(image_root, epoch_id, rank, source=source)
         if manifest is None:
             raise PreconditionError(
                 f"no image for rank {rank} of {job_id} on {self.node}, and no "
-                f"manifest under {image_root}/{epoch_id} lists that rank"
+                f"manifest under {image_root}/{epoch_id}"
+                + (f" or in the store from {source}" if source else "")
+                + " lists that rank"
             )
         _LOG.info("fetching image", job=job_id, epoch=epoch_id, rank=rank, node=self.node)
         return self.pipeline.fetch_rank(manifest, rank, images_dir)
 
-    def _find_manifest(self, image_root, epoch_id, rank):
+    @staticmethod
+    def _manifest_has(manifest, rank):
+        return int(rank) in {
+            int(r["rank"] if isinstance(r, dict) else r.rank) for r in manifest.ranks
+        }
+
+    def _find_manifest(self, image_root, epoch_id, rank, source=None):
         """The manifest holding `rank`.
 
         Each node writes its own manifest covering only its local ranks - no
         coordination needed at dump time. The cost is at read time: a node
-        restoring a rank that migrated in has to look through all of them.
+        restoring a rank that migrated in has to look through all of them,
+        and if the image root is not shared, none of them are here. Then the
+        source node's name is what finds it in the store.
         """
         directory = os.path.join(image_root, epoch_id)
         try:
             names = sorted(os.listdir(directory))
         except FileNotFoundError:
-            return None
+            names = []
         for name in names:
             if not (name.startswith("manifest-") and name.endswith(".json")):
                 continue
@@ -510,12 +611,21 @@ class Agent:
                 manifest = Manifest.load(os.path.join(directory, name))
             except (OSError, ValueError, KeyError):
                 continue
-            ranks = {
-                (r["rank"] if isinstance(r, dict) else r.rank) for r in manifest.ranks
-            }
-            if rank in ranks:
+            if self._manifest_has(manifest, rank):
                 return manifest
-        return None
+
+        if not source:
+            return None
+        key = self._manifest_key(epoch_id, source)
+        local = self._manifest_path(image_root, epoch_id, source)
+        try:
+            self.pipeline.backend.get(key, local)
+            manifest = Manifest.load(local)
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warn("manifest not in store", key=key, node=self.node, error=str(exc))
+            return None
+        _LOG.info("manifest fetched from store", key=key, node=self.node)
+        return manifest if self._manifest_has(manifest, rank) else None
 
     def _driver_call(self, fn, action, *args, **kwargs):
         try:
@@ -603,6 +713,17 @@ class Agent:
             )
         control.clear(epoch_id)
 
+    def clear_request(self, job_id, epoch_id=None):
+        """Remove a request file nobody will service.
+
+        The restore and abort paths clear it as they release the ranks. A
+        failure past the commit point releases nobody, and the file would
+        otherwise sit there for the next rank that starts on this node.
+        """
+        cleared = ControlDir(self.control_root, job_id).clear(epoch_id)
+        _LOG.info("request cleared", job=job_id, epoch=epoch_id, cleared=cleared)
+        return {"node": self.node, "cleared": bool(cleared)}
+
     def forget(self, job_id, ranks=None):
         """Relinquish ranks that now live somewhere else.
 
@@ -659,6 +780,10 @@ class Agent:
                 shards = self.pipeline.delete_epoch(Manifest.load(manifest_path))
             except Exception as exc:  # noqa: BLE001
                 _LOG.warn("shard deletion failed", epoch=epoch_id, error=str(exc))
+        try:
+            self.pipeline.backend.delete(self._manifest_key(epoch_id))
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warn("stored manifest not deleted", epoch=epoch_id, error=str(exc))
         removed_dir = False
         try:
             shutil.rmtree(directory)
@@ -700,10 +825,12 @@ def build_server(agent, addr=None):
         "dump",
         "restore",
         "abort",
+        "clear_request",
         "forget",
         "reap",
         "delete_images",
         "status",
+        "describe",
         "job_create",
         "job_env",
         "job_remove",
@@ -724,6 +851,7 @@ def main(argv=None):
 
     cfg = config.load()
     agent = Agent(cfg, node_name=args.node, control_root=args.control_root)
+    agent.rpc_addr = args.addr or cfg.agent_addr
     servers = [build_server(agent, args.addr or cfg.agent_addr).start()]
     rank_addr = args.rank_addr or cfg.rank_addr
     if rank_addr and rank_addr != (args.addr or cfg.agent_addr):

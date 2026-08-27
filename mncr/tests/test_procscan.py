@@ -8,7 +8,8 @@ from . import context  # noqa: F401
 from mncr.procscan import ProcScanner, Severity, summarize
 
 
-def build_proc(tmp, pid, fds=(), maps=()):
+def build_proc(tmp, pid, fds=(), maps=(), tcp=()):
+    """tcp: [(inode, local_hex, remote_hex, state_hex)] rows for net/tcp."""
     root = os.path.join(tmp, "proc")
     pdir = os.path.join(root, str(pid))
     os.makedirs(os.path.join(pdir, "fd"), exist_ok=True)
@@ -20,6 +21,15 @@ def build_proc(tmp, pid, fds=(), maps=()):
     with open(os.path.join(pdir, "maps"), "w") as fh:
         for path in maps:
             fh.write(f"7f00-7f01 rw-s 00000000 00:06 1234 {path}\n")
+    if tcp:
+        os.makedirs(os.path.join(pdir, "net"), exist_ok=True)
+        with open(os.path.join(pdir, "net", "tcp"), "w") as fh:
+            fh.write("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n")
+            for index, (inode, local, remote, state) in enumerate(tcp):
+                fh.write(
+                    f"   {index}: {local} {remote} {state} 00000000:00000000 00:00000000 "
+                    f"00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0\n"
+                )
     return root
 
 
@@ -30,6 +40,34 @@ class TestProcScan(unittest.TestCase):
     def test_clean_process_has_no_findings(self):
         root = build_proc(self.tmp, 1, fds=["/tmp/log", "socket:[123]"], maps=["/lib/x.so"])
         self.assertEqual(ProcScanner(root).scan(1), [])
+
+    def test_a_listening_socket_blocks_the_lock(self):
+        # 127.0.0.1:28028 listening - NCCL RAS, as measured.
+        root = build_proc(
+            self.tmp, 7, fds=["socket:[500]", "socket:[501]"],
+            tcp=[("500", "0100007F:6D7C", "00000000:0000", "0A")],
+        )
+        blocking = ProcScanner(root).blocking(7, Severity.BEFORE_LOCK)
+        self.assertEqual([f.kind for f in blocking], ["listening_socket"])
+        self.assertIn("127.0.0.1:28028", blocking[0].target)
+        self.assertIn("NCCL_RAS_ENABLE=0", blocking[0].why)
+
+    def test_an_established_socket_blocks_the_lock_too(self):
+        root = build_proc(
+            self.tmp, 8, fds=["socket:[600]"],
+            tcp=[("600", "CA061FAC:B868", "D9041FAC:1C0D", "01")],
+        )
+        blocking = ProcScanner(root).blocking(8, Severity.BEFORE_LOCK)
+        self.assertEqual([f.kind for f in blocking], ["tcp_socket"])
+        self.assertIn("172.31.6.202:47208 -> 172.31.4.217:7181", blocking[0].target)
+
+    def test_non_tcp_sockets_are_not_findings(self):
+        # A unix or netlink socket has no net/tcp row; CRIU handles those.
+        root = build_proc(
+            self.tmp, 9, fds=["socket:[700]"],
+            tcp=[("999", "0100007F:6D7C", "00000000:0000", "0A")],
+        )
+        self.assertEqual(ProcScanner(root).scan(9), [])
 
     def test_verbs_fd_blocks_the_lock(self):
         root = build_proc(self.tmp, 2, fds=["/dev/infiniband/uverbs3"])

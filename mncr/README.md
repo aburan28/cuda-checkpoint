@@ -35,12 +35,13 @@ that **every rank must vote before a single checkpoint call is issued**.
 | `mncr/` | all | phase model, RPC, process scanner, config, logging |
 | `audit/` | P0 | `LD_PRELOAD` allocation auditor, fleet audit, report, the expandable-segments experiment |
 | `torchckpt/` | P1 | in-process rank library: safe points, teardown, `assert_clean()`, rebuild |
+| `torchckpt/netmap/` | P1 | `LD_PRELOAD` bind shim: lets a migrated rank's NCCL listen on the node it is on now |
 | `agent/` | P2 | privileged node agent: driver calls, CRIU, job files, pid translation, verification |
 | `coord/` | P3, P4 | coordinator, two-phase commit, device maps, placement |
 | `imagestore/` | P5 | shard, compress, checksum, tiered storage, warm cache |
 | `k8s/` | P6 | CRDs, controller, admission, manifests |
 | `ncclx/` | P7 | NCCL strategy seam, benchmark, patch plan |
-| `verify/` | P8 | cluster simulator, chaos matrix, scale ladder, on-node smoke test |
+| `verify/` | P8 | cluster simulator, chaos matrix, scale ladder, on-node smoke test, multi-node harness |
 | `tests/` | P8 | unit and protocol tests |
 | `mncrctl` | — | operator CLI |
 | `mncr/metrics.py` | — | Prometheus endpoint on the agent and coordinator |
@@ -120,6 +121,21 @@ for everything else the process holds. `assert_clean()` runs automatically
 before the rank votes, and the agent re-runs the same scan from outside before
 it touches the driver.
 
+Three things a rank's environment has to say, all measured on real nodes
+([findings](docs/findings-multinode-595.md)) and all injected by the admission
+webhook when absent:
+
+```bash
+NCCL_RAS_ENABLE=0            # RAS keeps two listeners per process that no teardown closes
+FI_HMEM_CUDA_USE_GDRCOPY=0   # libfabric holds /dev/gdrdrv from plugin init on, EFA or not
+LD_PRELOAD=.../libmncr_netmap.so   # only if ranks may be restored on another node
+```
+
+The last one exists because NCCL keeps the node address it found at its first
+initialisation for the life of the process. A rank restored elsewhere would
+listen on a node it is no longer on; the shim rebinds it. See
+`torchckpt/netmap/mncr_netmap.c`.
+
 ### Why a safe point, and why ranks agree on a step
 
 Ranks are coupled by collectives but not aligned: when a request lands, one rank
@@ -128,12 +144,22 @@ whose ranks are on different steps is a correctness bug. So before tearing
 anything down, the ranks use the communicator that is about to be destroyed to
 agree on a step to stop at, and keep training until they all reach it.
 
+Across nodes there is a step before that one. The request is a file, written
+by each node's agent, and it lands on different nodes at different moments;
+NCCL matches collectives by order, so two ranks noticing it one step apart
+would pair an agreement collective with a training collective. While a group
+is live, every safe point therefore runs one tiny all_reduce carrying the
+request's identity, so every rank enters the epoch in the same step whether
+or not its own file has arrived yet. The cost is that collective and, on
+NCCL, a device sync per step; `torchckpt.runtime().coupled_polling = False`
+turns it off for loops that cannot pay it.
+
 ## On a GPU node
 
 ```bash
 sudo ./bootstrap-node.sh --cuda-checkpoint ../bin/x86_64_Linux/cuda-checkpoint
 make preflight      # can this node participate? uses the real backends
-make smoke          # four levels: driver, +criu, +agent, +full epoch
+make smoke          # six levels: driver, +criu, +agent, +full epoch, +NCCL, +restore from images
 ```
 
 `bootstrap-node.sh` installs the utility, builds CRIU with its CUDA plugin (no
@@ -149,7 +175,25 @@ never advertises itself as one that can.
 
 `smoke` runs the real driver and real CRIU against a real CUDA process, and
 proves the device memory survived by checksum. Level 4 is a full coordinator
-epoch — the same simulator, with the fakes swapped out.
+epoch — the same simulator, with the fakes swapped out. Level 5 puts the
+ranks in a real NCCL group (it needs a GPU per rank, so two or more), and
+level 6 checkpoints-and-stops, then restores the dead ranks from their images.
+
+## Across nodes
+
+```bash
+sudo python3 -m verify.cluster \
+    --node node-a=10.0.0.1 --node node-b=10.0.0.2 \
+    --store user@10.0.0.1:/var/lib/mncr/store
+```
+
+Real agents on every node, a real coordinator, ranks in a real NCCL group
+across the network, and three scenarios in order: checkpoint-and-continue,
+checkpoint-stop-restore, and a migration in which every rank is restored on a
+different node — images fetched through the store, device maps applied,
+rendezvous following rank 0 — followed by another checkpoint to prove the
+migrated job is still one. The remote side is reached by ssh and sudo; the
+store is anything `rsync` can write to.
 
 ## Operating it
 
@@ -219,21 +263,37 @@ Proven by test here:
 
 Proven on real hardware — driver 595.91.07, RTX PRO 6000 Blackwell, CRIU 4.2.1:
 
-- all four `make smoke` levels: driver, +CRIU, +agent, +full coordinator epoch,
-  with device memory verified by checksum at each
+- `make smoke` levels 1–4 and 6: driver, +CRIU, +agent, +full coordinator
+  epoch, and checkpoint-stop-restore from images, with device memory verified
+  by checksum at each
 - the `cuda-checkpoint` CLI backend and the CRIU backend
 - the interposer under the production `LD_PRELOAD` path
 - `make preflight` against a node that really does fail one of its checks
 
+Proven across two nodes — same driver, NCCL 2.29.7, torch 2.13, sockets:
+
+- a real NCCL process group torn down before the lock and rebuilt after the
+  restore, proven by all_reduce, in checkpoint-and-continue
+- checkpoint-and-stop, then both ranks restored from images by CRIU, with
+  their original pids
+- migration: every rank restored on the *other* node — image fetched through
+  the store, manifest found by source node, device map applied through the
+  CRIU plugin, NCCL rebuilt on the moved node — and the migrated job
+  checkpointed again; twice over, so a rank also comes back to its origin
+
 Still not proven:
 
-- NCCL-specific teardown — the gloo tests prove the shape, not the NVLS and
-  verbs releases only NCCL performs
-- multi-GPU, NVLS multicast, fabric handles, driver 610
-- restore onto a *different* node (this was one machine)
+- more than one GPU per node — intra-node NCCL, P2P through imported `cuMem`
+  handles, NVLS multicast — the account's quotas allowed no such node;
+  `make smoke` level 5 covers it on one that has them
+- IB/RoCE and EFA: whether the network plugin releases its verbs fds on
+  communicator destroy, and what a migrated rank's GIDs need
+- fabric handles, driver 610
 
-See [docs/findings-595-blackwell.md](docs/findings-595-blackwell.md), which
-includes the three production bugs that only hardware exposed.
+See [docs/findings-595-blackwell.md](docs/findings-595-blackwell.md) for the
+single-node measurements, including the three production bugs only hardware
+exposed, and [docs/findings-multinode-595.md](docs/findings-multinode-595.md)
+for the seven things that only two nodes could show.
 
 ## Measured on hardware
 

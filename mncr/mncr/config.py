@@ -32,6 +32,9 @@ class Config:
     lock_timeout_ms: int = _env("MNCR_LOCK_TIMEOUT_MS", 60000, int)
     checkpoint_timeout: float = _env("MNCR_CHECKPOINT_TIMEOUT", 900.0, float)
     dump_timeout: float = _env("MNCR_DUMP_TIMEOUT", 3600.0, float)
+    # How long a rank waits for its own copy of a request its peers already
+    # hold before acting on what the collective carried.
+    request_settle: float = _env("MNCR_REQUEST_SETTLE", 5.0, float)
 
     # paths
     jobfile_dir: str = _env("MNCR_JOBFILE_DIR", "/run/mncr/jobs")
@@ -45,6 +48,10 @@ class Config:
 
     # behaviour
     fake: bool = _env("MNCR_FAKE", False, bool)
+    # Where the agent's verification gates look. Injectable so a fake-driver
+    # run on a GPU node does not fail its dump gate on fds the fake driver
+    # never released.
+    proc_root: str = _env("MNCR_PROC_ROOT", "/proc")
     fake_call_latency: float = _env("MNCR_FAKE_CALL_LATENCY", 0.0, float)
     strict_clean: bool = _env("MNCR_STRICT_CLEAN", True, bool)
     allow_mnnvl: bool = _env("MNCR_ALLOW_MNNVL", False, bool)

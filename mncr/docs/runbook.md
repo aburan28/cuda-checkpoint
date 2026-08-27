@@ -26,9 +26,12 @@ a failure discovered at step 5 that was visible at step 1 costs a cluster.
    fleet-wide. Set it to `False` in the meantime.
 3. **Label nodes.** `mncr.io/checkpointable=true`, `mncr.io/driver-major`,
    `mncr.io/mnnvl`. The admission webhook and placement both read these.
-4. **`make smoke` on one node.** Four levels, in order: driver only, plus
-   CRIU, through the agent, then a full epoch. A failure at level *n* makes
-   every level above it meaningless, so fix and rerun rather than reading on.
+4. **`make smoke` on one node.** Six levels, in order: driver only, plus
+   CRIU, through the agent, a full epoch, the same with real NCCL (needs two
+   GPUs), then checkpoint-stop-restore from images. A failure at level *n*
+   makes every level above it meaningless, so fix and rerun rather than
+   reading on. Then **`verify/cluster.py` on two nodes**: continue, restore,
+   migrate. Nothing multi-node is proven until that table is green.
 5. **Apply CRDs, RBAC, the DaemonSet, the coordinator, the webhook.** The
    DaemonSet runs preflight as an init container, so a node that cannot
    participate fails at rollout rather than at somebody's commit point.
@@ -53,7 +56,34 @@ The one field that matters on a failed `GpuCheckpoint` is `status.jobIntact`.
 
 **Ranks vote dirty.** `assert_clean()` found something. The finding names the
 fd or mapping. Almost always a communicator that was not destroyed, a GDS or
-NIXL handle nobody remembered, or `expandable_segments` still on.
+NIXL handle nobody remembered, or one of the two measured on every node so far:
+
+- `gdrcopy_fd(/dev/gdrdrv)`: libfabric (aws-ofi-nccl) opens it at plugin init
+  and never closes it, EFA or not. Launch with `FI_HMEM_CUDA_USE_GDRCOPY=0`.
+- `listening_socket(127.0.0.1:28028)` and one on the node address: NCCL RAS.
+  Launch with `NCCL_RAS_ENABLE=0`. It also saves ten seconds of communicator
+  init.
+
+Neither can be released from inside the process; both have to be prevented
+at launch. The webhook injects both variables when a pod does not set them.
+
+**Migration fails in NCCL with `Cannot assign requested address`.** The rank
+was restored on another node and NCCL is listening on the address it cached
+at its first initialisation. Ranks that may be migrated need
+`LD_PRELOAD=<control root>/lib/libmncr_netmap.so`; the agent publishes it
+there and the webhook injects the variable.
+
+**Restore fails with `bad build-ID` or `bad mode`.** The target node has a
+different build of a library the rank mapped, or the same file with a
+different mode. CRIU is right to refuse. The usual cause is unattended
+upgrades on one node and not another; freeze node images, and run
+`verify/cluster.py`, which fingerprints the libraries ranks map and warns when
+nodes differ.
+
+**A fresh rank services an epoch nobody asked for.** A request file outlived
+a terminal failure. Ranks now ignore requests issued before they started and
+the coordinator clears request files on terminal failure; on an older
+deployment, delete `<control root>/jobs/<job>/request.json`.
 
 **Lock times out.** A rank is still draining work. If it recurs, the lock
 timeout is below your longest kernel - raise `MNCR_LOCK_TIMEOUT_MS`. If it

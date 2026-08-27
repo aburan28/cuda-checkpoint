@@ -43,6 +43,19 @@ spec:
           value: /run/mncr/jobs/train-7.jobfile
         - name: PYTORCH_CUDA_ALLOC_CONF
           value: "expandable_segments:True"
+        # Measured on real nodes (docs/findings-multinode-595.md): RAS keeps
+        # two listeners per process that CRIU must rebind on restore, and
+        # libfabric holds /dev/gdrdrv from plugin init on. The webhook injects
+        # both when absent; they are spelled out here so nobody wonders.
+        - name: NCCL_RAS_ENABLE
+          value: "0"
+        - name: FI_HMEM_CUDA_USE_GDRCOPY
+          value: "0"
+        # Only needed if this rank may be restored on another node: NCCL keeps
+        # the node address it found at first init. The agent publishes the
+        # shim into the control directory.
+        - name: LD_PRELOAD
+          value: /run/mncr/lib/libmncr_netmap.so
       resources:
         limits: {nvidia.com/gpu: 8}
       volumeMounts:

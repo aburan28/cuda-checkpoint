@@ -14,6 +14,8 @@ from mncr import log, metrics
 from mncr.errors import AbortableError, TerminalError, UnreleasedAbortError
 from mncr.proto import Epoch, Phase, Vote
 
+from .rendezvous import Rendezvous
+
 _LOG = log.get("coord.epoch")
 
 
@@ -22,7 +24,9 @@ class EpochRunner:
         self.pool = pool
         self.store = store
         self.cfg = cfg
-        self.node_info = node_info or {}
+        self.node_info = node_info if node_info is not None else {}
+        # Reads node_info at call time, so agents registered later are seen.
+        self.rendezvous = Rendezvous(self.node_info)
         # Recorded so an abort - which happens outside checkpoint()'s argument
         # list - releases ranks with the same collective backend they were
         # torn down from.
@@ -87,6 +91,15 @@ class EpochRunner:
 
     def _fail(self, epoch, reason):
         _LOG.error("epoch lost past commit point", epoch=epoch["epoch_id"], reason=reason)
+        # Nobody releases the ranks after this, so nobody clears the request
+        # file either. Do it here, best effort: a rank launched later on one
+        # of these nodes must not find an epoch waiting for it.
+        _results, errors = self.pool.fanout(
+            epoch.nodes(), "clear_request",
+            job_id=epoch["job_id"], epoch_id=epoch["epoch_id"], _timeout=30,
+        )
+        if errors:
+            _LOG.warn("request files not cleared", epoch=epoch["epoch_id"], errors=errors)
         self._save(epoch, Phase.FAILED, note=reason, error=reason)
         metrics.EPOCHS.inc(outcome="failed", job=epoch["job_id"])
         metrics.EPOCH_SECONDS.observe(
@@ -110,6 +123,12 @@ class EpochRunner:
         image_root = image_root or self.cfg.image_dir
         self.default_backend = backend
         epoch = Epoch.make(job_id, ranks, reason=reason)
+        # A fresh address for the rebuild unless the caller chose one. The
+        # same string goes to every rank, in the resume token and in the abort
+        # token alike - both paths end in init_process_group.
+        if init_method is None:
+            init_method = self.rendezvous.new(ranks)
+        epoch["init_method"] = init_method
         self.store.put(epoch)
         started = time.time()
         per_node = self._per_node_ranks(epoch)
@@ -237,6 +256,9 @@ class EpochRunner:
                 images.append({**image, "node": node})
         epoch["image_id"] = epoch["epoch_id"]
         epoch["images"] = images
+        # Where each rank's image was written. `ranks` is rewritten by every
+        # restore to say where the ranks are now; this is not.
+        epoch["dumped_on"] = {str(i["rank"]): i["node"] for i in images}
         self._save(epoch, Phase.DUMPED, note=f"{len(images)} images")
 
         requirements = self._requirements_for(nodes)
@@ -295,6 +317,11 @@ class EpochRunner:
         stored = self.store.get(epoch_id)
         epoch = Epoch(stored or Epoch.make(job_id, ranks, reason="restore"))
         previous = {int(r["rank"]): r["node"] for r in epoch.get("ranks", [])}
+        # A second restore of the same epoch must fetch from where the image
+        # was dumped, not from where the first restore put the ranks.
+        dumped_on = {
+            int(k): v for k, v in (epoch.get("dumped_on") or {}).items()
+        } or previous
         epoch["ranks"] = [dict(r) for r in ranks]
         epoch["phase"] = Phase.DUMPED.value
         # A fresh mark, so the RESTORING transition measures the restore and
@@ -303,12 +330,26 @@ class EpochRunner:
             {"at": time.time(), "from": Phase.DUMPED.value, "to": Phase.DUMPED.value,
              "note": "restore requested"}
         )
+        # Rank 0 may have moved; the address is computed from where it is now.
+        if init_method is None:
+            init_method = self.rendezvous.new(ranks)
+        epoch["init_method"] = init_method
         self._save(epoch, Phase.RESTORING)
 
         per_node = self._per_node_ranks(epoch)
         device_maps = device_maps or {}
         args = {
-            node: {**per_node[node], "device_map": device_maps.get(node)}
+            node: {
+                **per_node[node],
+                "device_map": device_maps.get(node),
+                # Where each rank's image was written, so a node that never
+                # saw it can find the manifest in the store.
+                "sources": {
+                    int(r["rank"]): dumped_on.get(int(r["rank"]))
+                    for r in epoch.ranks_on(node)
+                    if dumped_on.get(int(r["rank"]))
+                },
+            }
             for node in epoch.nodes()
         }
         results, errors = self.pool.fanout(

@@ -19,7 +19,7 @@ import dataclasses
 import os
 import time
 
-from mncr import config, log
+from mncr import config, log, netutil
 from mncr.errors import PreconditionError, TimeoutError_
 from mncr.proto import Vote
 
@@ -61,8 +61,13 @@ class _Runtime:
         self.proc_root = "/proc"
         self.pending = None          # {"epoch_id":..., "target_step":...}
         self.initialized = False
+        self.started_at = time.time()
         self.last_report = {}
+        self.last_rebuild = {}
         self.had_process_group = False
+        # Whether ranks agree over the communicator, every step, on whether an
+        # epoch has been requested. See safe_point().
+        self.coupled_polling = True
 
     # ------------------------------------------------------------- lifecycle
     def init(
@@ -106,6 +111,7 @@ class _Runtime:
                     os.getpid(),
                     self.world_size,
                     torch_backend.local_gpu_uuids(),
+                    ip=netutil.primary_ip("MNCR_RANK_IP", "MNCR_NODE_IP"),
                 )
             except Exception as exc:
                 # Registration is best-effort at startup: the agent may come up
@@ -127,12 +133,42 @@ class _Runtime:
 
     # ------------------------------------------------------------ safe point
     def safe_point(self):
-        """Service any pending epoch, then return so the caller can do a step."""
+        """Service any pending epoch, then return so the caller can do a step.
+
+        The request is a file, written by each node's agent, and it lands on
+        different nodes at different moments. Two ranks that notice it one
+        step apart would issue their agreement collective one step apart -
+        and NCCL matches collectives by order, so rank A's agreement would
+        pair with rank B's training all-reduce. So when a communicator is
+        live, the ranks first agree over it, every step, on whether anyone
+        has seen a request. That collective sits at the same position in
+        every rank's stream, which is what keeps everything after it aligned.
+        """
         self._require_init()
         step = self.status.step
 
         if self.pending is None:
-            request = self.control.poll_request()
+            request = self._fresh(self.control.poll_request())
+            if self.coupled_polling and torch_backend.distributed_ready():
+                mine = _epoch_int(request["epoch_id"]) if request else 0
+                seen, lookahead = torch_backend.agree_on_request(
+                    mine, int(request.get("lookahead", 1)) if request else 0
+                )
+                if seen and not request:
+                    # A peer has the request and this node's copy is still on
+                    # its way. Wait briefly for the file itself; failing that,
+                    # the collective carried enough to act on. Either way this
+                    # rank enters the epoch at the same step as everyone else.
+                    request = self._fresh(
+                        self.control.wait_for_request(timeout=float(self.cfg.request_settle))
+                    )
+                    if request is None:
+                        request = self._synthesize(seen, lookahead)
+                elif seen and request and mine != seen:
+                    _LOG.warn(
+                        "peers are acting on a different epoch",
+                        mine=request["epoch_id"], theirs=_epoch_id(seen),
+                    )
             if request and request.get("action") == "checkpoint":
                 self._begin(request)
 
@@ -140,6 +176,43 @@ class _Runtime:
             self._service()
 
         self.status.advance_step()
+
+    def _fresh(self, request):
+        """Drop a request issued before this process started.
+
+        A request file outlives the epoch that wrote it when that epoch
+        failed past the commit point: nobody is left to clear it. A rank
+        launched afterwards must not mistake it for its own.
+        """
+        if request is None:
+            return None
+        issued = float(request.get("issued_at") or 0)
+        if issued and issued < self.started_at:
+            _LOG.warn(
+                "ignoring a request issued before this rank started",
+                epoch=request.get("epoch_id"), issued_at=issued,
+            )
+            return None
+        return request
+
+    def _synthesize(self, seen, lookahead):
+        if seen <= 1:
+            # The id could not travel in the collective (not an "ep-<hex>"
+            # id), and the file never came. This rank sits the epoch out; its
+            # peers quiesce, miss its vote, and the coordinator aborts before
+            # the lock. Costly but safe.
+            _LOG.error("peers saw an epoch request this node never received")
+            return None
+        epoch_id = _epoch_id(seen)
+        self.control.mark_serviced(epoch_id)
+        _LOG.warn("request taken from peers; the file never arrived", epoch=epoch_id)
+        return {
+            "epoch_id": epoch_id,
+            "action": "checkpoint",
+            "lookahead": max(1, int(lookahead)),
+            "wait_timeout": float(self.cfg.checkpoint_timeout),
+            "synthesized": True,
+        }
 
     def _begin(self, request):
         epoch_id = request.get("epoch_id")
@@ -224,6 +297,11 @@ class _Runtime:
 
     def _resume(self, token, epoch_id):
         self.status.enter(RankState.RESUMING, epoch=epoch_id)
+        # Anything issued before the token that released this rank belongs
+        # to an epoch that is over. A process restored from an image carries
+        # its original started_at, so that alone would not catch a request
+        # file the epoch that dumped it left behind.
+        self.started_at = max(self.started_at, float(token.get("at") or 0))
         ctx = ResumeContext(
             epoch_id=epoch_id,
             rank=int(token.get("rank", self.rank)),
@@ -240,15 +318,16 @@ class _Runtime:
         self.rank, self.world_size = ctx.rank, ctx.world_size
 
         if self.auto_teardown and self.had_process_group:
-            torch_backend.default_rebuild(ctx)
+            self.last_rebuild = torch_backend.default_rebuild(ctx)
         for name, hook in self.resume_hooks:
             hook(ctx)
         if graphs.REGISTRY.names():
             graphs.REGISTRY.recapture_all()
 
         if ctx.restored:
-            # A restored process may have a different host pid and a different
-            # agent; re-announce before anything else can go wrong.
+            # A restored process may have a different host pid, a different
+            # address and a different agent; re-announce before anything else
+            # can go wrong.
             try:
                 self.agent.register(
                     self.job_id,
@@ -256,11 +335,34 @@ class _Runtime:
                     os.getpid(),
                     self.world_size,
                     torch_backend.local_gpu_uuids(),
+                    ip=netutil.primary_ip("MNCR_RANK_IP", "MNCR_NODE_IP"),
                 )
             except Exception as exc:
                 _LOG.warn("re-registration failed", error=str(exc))
 
         self.status.enter(RankState.RUNNING, epoch=epoch_id)
+
+
+def _epoch_int(epoch_id):
+    """An epoch id as an integer that survives an int64 all_reduce.
+
+    Ids are "ep-" plus twelve hex digits (mncr.proto.new_id), 48 bits. Anything
+    else collapses to 1: still "somebody has a request", but not recoverable
+    from the collective, so a rank without the file has to wait for it.
+    """
+    text = str(epoch_id or "")
+    if text.startswith("ep-"):
+        try:
+            value = int(text[3:], 16)
+            if 1 < value < (1 << 62):
+                return value
+        except ValueError:
+            pass
+    return 1
+
+
+def _epoch_id(value):
+    return f"ep-{int(value):012x}"
 
 
 _RT = _Runtime()

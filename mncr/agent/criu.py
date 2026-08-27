@@ -15,12 +15,28 @@ is load-bearing:
 
 Kubelet's own ContainerCheckpoint is deliberately not used: it will happily dump
 a container whose CUDA state has not been checkpointed. The agent owns ordering.
+
+## Restoring onto different hardware
+
+CRIU's CUDA plugin restores CUDA itself, from inside `criu restore`, by running
+`cuda-checkpoint --action restore` while the task is still frozen. It has no
+notion of a device map, and CRIU 4.x refuses to restore an image whose
+inventory names a plugin that is not loaded - so the plugin can be neither
+bypassed nor told about the migration. What it can be given is a different
+`cuda-checkpoint`: the plugin resolves the binary through PATH, so the agent
+puts a shim ahead of the real one that appends `--device-map` to exactly the
+restore call, taken from `MNCR_DEVICE_MAP`. Every other invocation - the `-h`
+capability probe, `--get-restore-tid`, `--get-state`, lock, unlock - passes
+straight through. Same-hardware restores never set the variable and never see
+the shim's branch.
 """
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import tempfile
 
 from mncr import log
 from mncr.errors import CriuError
@@ -31,19 +47,70 @@ DEFAULT_EXTERNAL = (
     "mnt[]:m",              # inherited mounts, resolved by the restore side
 )
 
+SHIM_NAME = "cuda-checkpoint"
+SHIM_TEMPLATE = """#!/bin/sh
+# Installed by the mncr agent. See agent/criu.py.
+real={real}
+if [ -n "${{MNCR_DEVICE_MAP:-}}" ]; then
+  action=""; prev=""; mapped=0
+  for a in "$@"; do
+    [ "$prev" = "--action" ] && action="$a"
+    [ "$a" = "--device-map" ] && mapped=1
+    prev="$a"
+  done
+  if [ "$action" = "restore" ] && [ "$mapped" -eq 0 ]; then
+    exec "$real" "$@" --device-map "$MNCR_DEVICE_MAP"
+  fi
+fi
+exec "$real" "$@"
+"""
+
 
 class CriuBackend:
-    def __init__(self, binary="criu", libdir="/usr/lib/criu", timeout=3600.0):
+    def __init__(self, binary="criu", libdir="/usr/lib/criu", timeout=3600.0,
+                 cuda_checkpoint="cuda-checkpoint", shim_dir=None):
         self.binary = binary
         self.libdir = libdir
         self.timeout = timeout
+        self.cuda_checkpoint = cuda_checkpoint
+        self.shim_dir = shim_dir or os.path.join(tempfile.gettempdir(), "mncr-criu-shim")
 
-    def _run(self, args, timeout=None):
+    def shim_env(self, device_map):
+        """Environment for a criu restore that must apply `device_map`."""
+        real = shutil.which(self.cuda_checkpoint)
+        if not real:
+            raise CriuError(
+                f"cannot install the cuda-checkpoint shim: {self.cuda_checkpoint} "
+                f"is not on PATH"
+            )
+        os.makedirs(self.shim_dir, exist_ok=True)
+        path = os.path.join(self.shim_dir, SHIM_NAME)
+        content = SHIM_TEMPLATE.format(real=shlex.quote(os.path.abspath(real)))
+        try:
+            with open(path) as fh:
+                current = fh.read()
+        except OSError:
+            current = None
+        if current != content:
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as fh:
+                fh.write(content)
+            os.chmod(tmp, 0o755)
+            os.replace(tmp, path)
+        env = dict(os.environ)
+        env["PATH"] = self.shim_dir + os.pathsep + env.get(
+            "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        )
+        env["MNCR_DEVICE_MAP"] = str(device_map)
+        return env
+
+    def _run(self, args, timeout=None, env=None):
         cmd = [self.binary] + args
         _LOG.info("criu", cmd=" ".join(cmd[:8]) + (" ..." if len(cmd) > 8 else ""))
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout or self.timeout
+                cmd, capture_output=True, text=True, timeout=timeout or self.timeout,
+                env=env,
             )
         except FileNotFoundError as exc:
             raise CriuError(f"{self.binary} not found on PATH") from exc
@@ -96,13 +163,18 @@ class CriuBackend:
         self._run(args)
         return images_dir
 
-    def restore(self, images_dir, detached=True, external=(), extra=(), pidfile=None):
+    def restore(self, images_dir, detached=True, external=(), extra=(), pidfile=None,
+                device_map=None):
         """Restore and return the pid of the restored process.
 
         The pid is not optional information: on a node that did not take the
         checkpoint, the agent has no registry entry for this rank, and the pid
         is what every subsequent driver call needs. --pidfile is the only way
         criu reports it back for a detached restore.
+
+        device_map, when given, reaches the CUDA plugin through the shim
+        described at the top of this module. Pass it only for a restore onto
+        hardware other than the image's own; an identity map is noise.
         """
         pidfile = pidfile or os.path.join(images_dir, "restored.pid")
         args = ["restore", "--pidfile", pidfile] + self._common(
@@ -110,7 +182,12 @@ class CriuBackend:
         )
         if detached:
             args.append("--restore-detached")
-        self._run(args)
+        env = None
+        if device_map:
+            env = self.shim_env(device_map)
+            _LOG.info("restoring with a device map via the plugin shim",
+                      device_map=device_map, shim=self.shim_dir)
+        self._run(args, env=env)
         try:
             with open(pidfile) as fh:
                 return int(fh.read().strip())
@@ -129,6 +206,7 @@ class FakeCriuBackend(CriuBackend):
     def __init__(self, *_args, **_kwargs):
         self.dumps = []
         self.restores = []
+        self.restore_maps = []   # device_map given to each restore, None if none
         self._fail = set()
 
     def fail_next(self, op):
@@ -153,7 +231,8 @@ class FakeCriuBackend(CriuBackend):
         self.dumps.append((pid, images_dir))
         return images_dir
 
-    def restore(self, images_dir, detached=True, external=(), extra=(), pidfile=None):
+    def restore(self, images_dir, detached=True, external=(), extra=(), pidfile=None,
+                device_map=None):
         self._check("restore")
         marker = os.path.join(images_dir, "fake-image.json")
         if not os.path.exists(marker):
@@ -161,6 +240,7 @@ class FakeCriuBackend(CriuBackend):
         with open(marker) as fh:
             pid = int(json.load(fh)["pid"])
         self.restores.append(images_dir)
+        self.restore_maps.append(device_map)
         return pid
 
     def available(self):
@@ -168,8 +248,12 @@ class FakeCriuBackend(CriuBackend):
 
 
 def make(cfg):
-    return (
-        FakeCriuBackend()
-        if cfg.fake
-        else CriuBackend(cfg.criu, cfg.criu_libdir, cfg.dump_timeout)
+    if cfg.fake:
+        return FakeCriuBackend()
+    return CriuBackend(
+        cfg.criu,
+        cfg.criu_libdir,
+        cfg.dump_timeout,
+        cuda_checkpoint=cfg.cuda_checkpoint,
+        shim_dir=os.path.join(cfg.cache_dir, "criu-shim"),
     )

@@ -19,9 +19,13 @@ help:
 	@echo "on a GPU node"
 	@echo "  ./bootstrap-node.sh --cuda-checkpoint <path>   provision it first"
 	@echo "  make preflight   can this node participate? (real backends)"
-	@echo "  make smoke       driver, criu, agent and a full epoch, for real"
+	@echo "  make smoke       driver, criu, agent, a full epoch, NCCL, restore from images, for real"
 	@echo "  make p0          fleet audit and allocation report"
 	@echo "  make auditor     build the LD_PRELOAD allocation auditor"
+	@echo "  make netmap      build the LD_PRELOAD bind shim for migratable ranks"
+	@echo ""
+	@echo "across nodes"
+	@echo "  python3 -m verify.cluster --node a=IP --node b=IP --store user@IP:/path"
 	@echo ""
 	@echo "packaging"
 	@echo "  make images      build the agent and control container images"
@@ -35,6 +39,8 @@ check:
 	  n = sum(len([d for d in yaml.safe_load_all(open(f)) if d]) for f in files); \
 	  print(f'manifests: ok ({n} documents in {len(files)} files)')"
 	@$(MAKE) -s -C audit/interpose test
+	@if [ "$$(uname -s)" = Linux ]; then $(MAKE) -s -C torchckpt/netmap test; \
+	  else echo "netmap: Linux only, skipped"; fi
 	@shellcheck audit/fleet_audit.sh && echo "shell: ok"
 
 .PHONY: test
@@ -66,9 +72,12 @@ images:
 	docker build --target control -t mncr-control:$(shell $(PY) -c "import mncr; print(mncr.__version__)") .
 	docker build --target agent   -t mncr-agent:$(shell $(PY) -c "import mncr; print(mncr.__version__)") .
 
-.PHONY: auditor interposer
+.PHONY: auditor interposer netmap
 auditor:
 	$(MAKE) -C audit/interpose
+
+netmap:
+	$(MAKE) -C torchckpt/netmap
 
 # Builds the interposer and runs it against a stand-in driver. On Linux that is
 # the production LD_PRELOAD path; on macOS it links directly, which covers the
@@ -87,3 +96,4 @@ clean:
 	find . -name '__pycache__' -type d -prune -exec rm -rf {} +
 	rm -rf vendor-bin
 	$(MAKE) -C audit/interpose clean
+	$(MAKE) -C torchckpt/netmap clean

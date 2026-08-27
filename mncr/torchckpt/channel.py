@@ -99,6 +99,20 @@ class ControlDir:
         self._serviced.add(epoch_id)
         return request
 
+    def mark_serviced(self, epoch_id):
+        """Treat `epoch_id` as already seen, so a late file is not serviced twice."""
+        self._serviced.add(epoch_id)
+
+    def wait_for_request(self, timeout, poll_interval=0.02):
+        """Block until a request appears, for a rank whose peers already have it."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            request = self.poll_request()
+            if request is not None:
+                return request
+            time.sleep(poll_interval)
+        return None
+
     def wait_for_token(self, rank, epoch_id, timeout, poll_interval=0.05):
         """Block until the agent leaves a token for this rank in this epoch.
 
@@ -166,7 +180,7 @@ class AgentClient:
             _LOG.error("vote failed", rank=rank, epoch=epoch_id, error=str(exc))
             raise
 
-    def register(self, job_id, rank, host_pid, world_size, gpu_uuids):
+    def register(self, job_id, rank, host_pid, world_size, gpu_uuids, ip=None):
         with rpc.Client(self.addr, timeout=self.timeout) as client:
             return client.call(
                 "rank_register",
@@ -175,4 +189,5 @@ class AgentClient:
                 host_pid=host_pid,
                 world_size=world_size,
                 gpu_uuids=gpu_uuids,
+                ip=ip,
             )
