@@ -7,19 +7,26 @@ a failure discovered at step 5 that was visible at step 1 costs a cluster.
 
 1. **`make p0` on every node.** Fix every blocker before anything else. The
    common ones are a driver below 610, a missing `cuda_plugin.so`, and host RAM
-   headroom below total device memory.
+   headroom below total device memory. Then `make preflight` on one node, which
+   checks the same ground using the real backends and actually creates a job
+   file rather than assuming it can.
 2. **Run the expandable-segments experiment on one real node.**
    `audit/experiments/expandable_segments.py`. Until it has run you do not know
    whether `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` must be off
    fleet-wide. Set it to `False` in the meantime.
 3. **Label nodes.** `mncr.io/checkpointable=true`, `mncr.io/driver-major`,
    `mncr.io/mnnvl`. The admission webhook and placement both read these.
-4. **Apply CRDs, RBAC, the DaemonSet, the coordinator.**
-5. **Add `torchckpt.init()` and a `safe_point()` to the training loop.** Start
+4. **`make smoke` on one node.** Four levels, in order: driver only, plus
+   CRIU, through the agent, then a full epoch. A failure at level *n* makes
+   every level above it meaningless, so fix and rerun rather than reading on.
+5. **Apply CRDs, RBAC, the DaemonSet, the coordinator, the webhook.** The
+   DaemonSet runs preflight as an init container, so a node that cannot
+   participate fails at rollout rather than at somebody's commit point.
+6. **Add `torchckpt.init()` and a `safe_point()` to the training loop.** Start
    with `strict_clean=True`. A rank that cannot prove it is clean should fail
    loudly at prepare time, when failure is still free.
-6. **One `GpuCheckpoint` with `mode: continue` on a single-node job.**
-7. **Scale to multi-node, then to a `CheckpointPolicy`.**
+7. **One `GpuCheckpoint` with `mode: continue` on a single-node job.**
+8. **Scale to multi-node, then to a `CheckpointPolicy`.**
 
 ## Reading a failure
 
@@ -62,6 +69,42 @@ Check the node label and the webhook.
   property.
 * Job files are single-use and node-local. Delete a job before relaunching it.
 * Restoring across driver major versions is not guaranteed and is refused.
+
+## What to watch
+
+Two series, and the distinction between them is the whole operational model:
+
+```
+mncr_epochs_total{outcome="aborted"}   failed before the commit point
+mncr_epochs_total{outcome="failed"}    failed after it
+```
+
+An `aborted` rate above zero is a bug to fix at leisure - the job survived every
+one of them. A single `failed` means a job was lost. Alert on the second
+immediately; trend the first.
+
+Beyond those: `mncr_stopped_seconds` is the number users feel, and
+`mncr_gate_findings_total{kind=...}` tells you exactly which resource ranks keep
+failing to release, which is usually the fastest route to the cause.
+
+## Retention
+
+`CheckpointPolicy.spec.retain` bounds how many images a job keeps; the
+controller sweeps after every successful policy checkpoint, and `mncrctl gc`
+does it on demand. Two things are never deleted: the newest `retain` images, and
+whatever the job's last-good pointer names — deleting the image a failed epoch
+would fall back to is the one mistake retention must not make.
+
+The epoch record survives its image, marked `pruned`. Knowing an image once
+existed and was reclaimed is worth a few hundred bytes when somebody asks where
+it went.
+
+## When a policy keeps failing
+
+After `suspendAfterFailures` consecutive failures the controller sets
+`status.suspended` and stops attempting. Retrying a broken policy turns one
+broken job into load on every node it touches. Clear the flag by hand once the
+cause is fixed — the suspension is meant to be noticed.
 
 ## What to do when the coordinator restarts mid-epoch
 

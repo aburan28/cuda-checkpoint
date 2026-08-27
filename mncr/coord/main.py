@@ -8,7 +8,7 @@ import argparse
 import json
 import time
 
-from mncr import config, log, rpc
+from mncr import config, log, metrics, rpc
 from mncr.proto import RankRef
 
 from .client import AgentPool
@@ -50,7 +50,7 @@ class Coordinator:
         return self._jobs[job_id]
 
     def checkpoint(self, job_id, mode="continue", image_root=None, init_method=None,
-                   reason="manual", pre_dump=False):
+                   reason="manual", pre_dump=False, backend="nccl"):
         epoch = self.runner.checkpoint(
             job_id,
             self.job_ranks(job_id),
@@ -59,11 +59,13 @@ class Coordinator:
             init_method=init_method,
             reason=reason,
             pre_dump=pre_dump,
+            backend=backend,
         )
         return {"epoch_id": epoch["epoch_id"], "phase": epoch["phase"],
                 "images": len(epoch.get("images", [])), "seconds": epoch.get("seconds")}
 
-    def restore(self, job_id, epoch_id, targets=None, image_root=None, init_method=None):
+    def restore(self, job_id, epoch_id, targets=None, image_root=None,
+                init_method=None, backend="nccl"):
         """Restore onto `targets` ({node: [ranks]}), defaulting to where it ran."""
         source = self.store.get(epoch_id)
         if source is None:
@@ -85,7 +87,7 @@ class Coordinator:
 
         epoch = self.runner.restore(
             job_id, epoch_id, ranks, image_root=image_root,
-            device_maps=device_maps, init_method=init_method,
+            device_maps=device_maps, init_method=init_method, backend=backend,
         )
         self._jobs[job_id] = ranks
         return {"epoch_id": epoch_id, "phase": epoch["phase"],
@@ -128,6 +130,58 @@ class Coordinator:
         )
         return {"nodes": [n.get("host") for n in chosen], "rejected": rejected}
 
+    def gc(self, job_id, retain=3, image_root=None):
+        """Reclaim images beyond the retention count.
+
+        Two things are never deleted: the newest `retain` images, and whatever
+        the job's last-good pointer names. Deleting the image a failed epoch
+        would fall back to is the one mistake retention must not make.
+        """
+        retain = max(1, int(retain))
+        keep_epochs = self.store.retained(job_id)[:retain]
+        keep = {e["epoch_id"] for e in keep_epochs}
+        good = self.store.last_good(job_id)
+        if good and good.get("epoch_id"):
+            keep.add(good["epoch_id"])
+
+        candidates = [
+            e for e in self.store.retained(job_id) if e["epoch_id"] not in keep
+        ]
+        deleted, incomplete = [], []
+        for epoch in candidates:
+            # The images live where they were dumped, which a later restore
+            # onto other nodes does not change - `ranks` is the placement now,
+            # `images` is where the bytes are.
+            nodes = sorted(
+                {i["node"] for i in epoch.get("images", []) if i.get("node")}
+                or {r["node"] for r in epoch.get("ranks", [])}
+            )
+            _results, errors = self.pool.fanout(
+                nodes,
+                "delete_images",
+                job_id=job_id,
+                epoch_id=epoch["epoch_id"],
+                image_root=image_root or self.cfg.image_dir,
+            )
+            if errors:
+                # Not pruned: the bytes are still there, and an epoch marked
+                # pruned is never looked at again. The next sweep retries.
+                _LOG.warn(
+                    "image deletion incomplete; will retry",
+                    epoch=epoch["epoch_id"],
+                    errors=errors,
+                )
+                incomplete.append(epoch["epoch_id"])
+                continue
+            self.store.mark_pruned(epoch["epoch_id"])
+            deleted.append(epoch["epoch_id"])
+
+        _LOG.info(
+            "gc complete", job=job_id, retained=len(keep), deleted=len(deleted),
+            incomplete=len(incomplete),
+        )
+        return {"kept": sorted(keep), "deleted": deleted, "incomplete": incomplete}
+
     def status(self, job_id=None):
         return {
             "nodes": self.pool.nodes(),
@@ -161,6 +215,7 @@ def build_server(coord, addr=None):
         "checkpoint",
         "restore",
         "plan_restore",
+        "gc",
         "status",
         "recover",
     ):
@@ -173,6 +228,7 @@ def main(argv=None):
     ap.add_argument("--addr", default=None)
     ap.add_argument("--agents", default="", help="node=addr,node=addr")
     ap.add_argument("--epoch-dir", default=None)
+    ap.add_argument("--metrics-port", type=int, default=9181)
     args = ap.parse_args(argv)
 
     cfg = config.load()
@@ -187,6 +243,7 @@ def main(argv=None):
         store=EpochStore(args.epoch_dir) if args.epoch_dir else None,
     )
     server = build_server(coord, args.addr or cfg.coord_addr).start()
+    metrics_server = metrics.serve(args.metrics_port) if args.metrics_port else None
     print(json.dumps(coord.recover()))
     try:
         while True:
@@ -195,6 +252,9 @@ def main(argv=None):
         pass
     finally:
         server.stop()
+        if metrics_server:
+            metrics_server.shutdown()
+            metrics_server.server_close()
     return 0
 
 

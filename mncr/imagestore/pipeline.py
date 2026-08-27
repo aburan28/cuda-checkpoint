@@ -215,6 +215,31 @@ class Pipeline:
         )
         return manifest
 
+    # ----------------------------------------------------------------- delete
+    def delete_epoch(self, manifest):
+        """Remove every shard of an image. Retention has to reach the bytes.
+
+        Returns what it could not delete rather than raising: a half-deleted
+        image is still gone as far as restore is concerned, and failing here
+        must not stop the rest of the sweep.
+        """
+        removed, failed = 0, []
+        for entry in manifest.ranks:
+            rank = entry.rank if isinstance(entry, RankImage) else entry["rank"]
+            shards = entry.shards if isinstance(entry, RankImage) else entry["shards"]
+            for shard in shards:
+                name = shard.name if isinstance(shard, Shard) else shard["name"]
+                key = f"{manifest.image_id}/rank-{rank}/{name}"
+                try:
+                    if self.backend.delete(key):
+                        removed += 1
+                except Exception as exc:  # noqa: BLE001
+                    failed.append({"key": key, "error": str(exc)})
+        _LOG.info(
+            "image deleted", image=manifest.image_id, shards=removed, failed=len(failed)
+        )
+        return {"removed": removed, "failed": failed}
+
     # ---------------------------------------------------------------- restore
     def fetch_rank(self, manifest, rank, dest_dir):
         """Reassemble one rank's image directory from its shards."""

@@ -10,7 +10,7 @@ Everything else here is bookkeeping around that rule.
 
 import time
 
-from mncr import log
+from mncr import log, metrics
 from mncr.errors import AbortableError, TerminalError, UnreleasedAbortError
 from mncr.proto import Epoch, Phase, Vote
 
@@ -23,11 +23,20 @@ class EpochRunner:
         self.store = store
         self.cfg = cfg
         self.node_info = node_info or {}
+        # Recorded so an abort - which happens outside checkpoint()'s argument
+        # list - releases ranks with the same collective backend they were
+        # torn down from.
+        self.default_backend = "nccl"
 
     # ------------------------------------------------------------- utilities
     def _save(self, epoch, phase=None, note=None, error=None):
         if phase is not None:
+            previous = epoch.phase
+            entered = epoch["history"][-1]["at"] if epoch["history"] else epoch["created_at"]
             epoch.set_phase(phase, note)
+            metrics.PHASE_SECONDS.observe(
+                max(0.0, time.time() - entered), phase=previous.value
+            )
         if error is not None:
             epoch["error"] = str(error)
         self.store.put(epoch)
@@ -50,6 +59,7 @@ class EpochRunner:
             epoch_id=epoch["epoch_id"],
             reason=reason,
             init_method=init_method,
+            backend=self.default_backend,
             world_size=len(epoch["ranks"]),
         )
         # Whether every rank was released. The epoch is still aborted rather
@@ -63,6 +73,10 @@ class EpochRunner:
                        errors=errors)
             reason = f"{reason}; abort incomplete on {sorted(errors)}, ranks there are unreleased"
         self._save(epoch, Phase.ABORTED, note=reason, error=reason)
+        metrics.EPOCHS.inc(outcome="aborted", job=epoch["job_id"])
+        metrics.EPOCH_SECONDS.observe(
+            time.time() - epoch["created_at"], outcome="aborted"
+        )
         if errors:
             # Raised here, ahead of the caller's own AbortableError, so the
             # distinction reaches whoever reports on the job.
@@ -74,6 +88,10 @@ class EpochRunner:
     def _fail(self, epoch, reason):
         _LOG.error("epoch lost past commit point", epoch=epoch["epoch_id"], reason=reason)
         self._save(epoch, Phase.FAILED, note=reason, error=reason)
+        metrics.EPOCHS.inc(outcome="failed", job=epoch["job_id"])
+        metrics.EPOCH_SECONDS.observe(
+            time.time() - epoch["created_at"], outcome="failed"
+        )
         raise TerminalError(
             f"epoch {epoch['epoch_id']} failed after the commit point: {reason}. "
             f"Ranks cannot be resumed in place; restore the last good image."
@@ -81,7 +99,8 @@ class EpochRunner:
 
     # -------------------------------------------------------------- the flow
     def checkpoint(self, job_id, ranks, mode="continue", image_root=None,
-                   init_method=None, reason="manual", pre_dump=False):
+                   init_method=None, reason="manual", pre_dump=False,
+                   backend="nccl"):
         """Run one checkpoint epoch.
 
         mode="continue"  checkpoint and keep the job running (fault tolerance)
@@ -89,6 +108,7 @@ class EpochRunner:
         pre_dump=True    copy pages before the lock, shrinking the stop window
         """
         image_root = image_root or self.cfg.image_dir
+        self.default_backend = backend
         epoch = Epoch.make(job_id, ranks, reason=reason)
         self.store.put(epoch)
         started = time.time()
@@ -133,6 +153,8 @@ class EpochRunner:
             for vote in result.get("votes", []):
                 votes[int(vote["rank"])] = vote
         epoch["votes"] = votes
+        for vote in votes.values():
+            metrics.VOTES.inc(verdict=vote["vote"], job=job_id)
 
         if errors:
             self._abort(epoch, f"prepare failed on {sorted(errors)}", init_method)
@@ -173,6 +195,7 @@ class EpochRunner:
             self._abort(epoch, f"lock failed on {sorted(errors)}", init_method)
             raise AbortableError(f"lock failed: {errors}")
         self._save(epoch, Phase.LOCKED)
+        locked_at = time.time()
 
         # ------------------------------------------------ COMMIT POINT below
         # Recorded before the first checkpoint call goes out, not after the
@@ -227,6 +250,7 @@ class EpochRunner:
                 image_root=image_root,
                 from_images=False,   # the processes never died
                 init_method=init_method,
+                backend=backend,
                 world_size=len(epoch["ranks"]),
                 _timeout=self.cfg.checkpoint_timeout,
             )
@@ -240,6 +264,10 @@ class EpochRunner:
 
         epoch["seconds"] = round(time.time() - started, 3)
         self.store.put(epoch)
+        metrics.EPOCHS.inc(outcome="succeeded", job=job_id, mode=mode)
+        metrics.EPOCH_SECONDS.observe(epoch["seconds"], outcome="succeeded")
+        # The number an operator feels: how long the job was not running.
+        metrics.STOPPED_SECONDS.observe(time.time() - locked_at, mode=mode)
         _LOG.info(
             "checkpoint complete",
             epoch=epoch["epoch_id"],
@@ -252,7 +280,7 @@ class EpochRunner:
 
     # ----------------------------------------------------------- restore
     def restore(self, job_id, epoch_id, ranks, image_root=None, device_maps=None,
-                init_method=None):
+                init_method=None, backend="nccl"):
         """Bring a dumped job back, possibly onto different nodes.
 
         device_maps is {node: "old=new,..."} because each node's target UUIDs
@@ -266,6 +294,12 @@ class EpochRunner:
         previous = {int(r["rank"]): r["node"] for r in epoch.get("ranks", [])}
         epoch["ranks"] = [dict(r) for r in ranks]
         epoch["phase"] = Phase.DUMPED.value
+        # A fresh mark, so the RESTORING transition measures the restore and
+        # not the time the image sat on disk.
+        epoch["history"].append(
+            {"at": time.time(), "from": Phase.DUMPED.value, "to": Phase.DUMPED.value,
+             "note": "restore requested"}
+        )
         self._save(epoch, Phase.RESTORING)
 
         per_node = self._per_node_ranks(epoch)
@@ -283,6 +317,7 @@ class EpochRunner:
             image_root=image_root,
             from_images=True,
             init_method=init_method,
+            backend=backend,
             world_size=len(epoch["ranks"]),
             _timeout=self.cfg.dump_timeout,
         )

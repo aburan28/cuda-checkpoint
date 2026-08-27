@@ -40,8 +40,10 @@ that **every rank must vote before a single checkpoint call is issued**.
 | `imagestore/` | P5 | shard, compress, checksum, tiered storage, warm cache |
 | `k8s/` | P6 | CRDs, controller, admission, manifests |
 | `ncclx/` | P7 | NCCL strategy seam, benchmark, patch plan |
-| `verify/` | P8 | cluster simulator, chaos matrix, scale ladder |
+| `verify/` | P8 | cluster simulator, chaos matrix, scale ladder, on-node smoke test |
 | `tests/` | P8 | unit and protocol tests |
+| `mncrctl` | — | operator CLI |
+| `mncr/metrics.py` | — | Prometheus endpoint on the agent and coordinator |
 
 ## Try it without a GPU
 
@@ -51,10 +53,23 @@ the hardware is simulated.
 
 ```bash
 make check     # compile everything, validate manifests, lint shell and C
-make test      # 85 unit and protocol tests
+make test      # 136 unit and protocol tests
 make chaos     # fault injection at every phase
 make scale     # does wall clock track ranks-per-node or job size?
 ```
+
+Two of those deserve calling out, because they cover the parts that are
+otherwise only testable on hardware:
+
+- **The interposer runs against a stand-in driver.** `make check` builds
+  `cuda_audit.so`, loads it over a fake libcuda and asserts what it recorded —
+  including that a call resolved through `cuGetProcAddress` went through the
+  wrapper. Interposing the symbol alone would pass a naive test and silently
+  miss every allocation NCCL makes.
+- **Step agreement runs against a real process group.** gloo on CPU gives real
+  collectives without a GPU, so `tests/test_collectives.py` proves ranks
+  arriving at different local steps all stop at the same one, and that a torn
+  down group comes back working — after a successful epoch and after an abort.
 
 `make chaos` asserts the two invariants that matter:
 
@@ -107,13 +122,62 @@ whose ranks are on different steps is a correctness bug. So before tearing
 anything down, the ranks use the communicator that is about to be destroyed to
 agree on a step to stop at, and keep training until they all reach it.
 
+## On a GPU node
+
+Two commands stand between the simulator and real hardware. Run them in order.
+
+```bash
+make preflight      # can this node participate? uses the real backends
+make smoke          # four levels: driver, +criu, +agent, +full epoch
+```
+
+`preflight` checks tooling, driver and CRIU versions, the CUDA plugin,
+privileges, host RAM against device memory, and actually creates a job file. It
+runs as an init container on the DaemonSet, so a node that cannot participate
+never advertises itself as one that can.
+
+`smoke` runs the real driver and real CRIU against a real CUDA process, and
+proves the device memory survived by checksum. Level 4 is a full coordinator
+epoch — the same simulator, with the fakes swapped out.
+
 ## Operating it
+
+Pods labelled `mncr.io/checkpointable=true` are mutated on admission: the
+control-directory mount, the `MNCR_*` environment and the job-file path are all
+injected, so a rank pod needs the label and nothing else. Anything the author
+set explicitly is left alone.
 
 ```bash
 kubectl apply -f k8s/crds/
 kubectl apply -f k8s/manifests/rbac.yaml
 kubectl apply -f k8s/manifests/agent-daemonset.yaml
 kubectl apply -f k8s/manifests/coordinator.yaml
+kubectl apply -f k8s/manifests/admission.yaml   # needs a TLS secret
+kubectl apply -f k8s/manifests/webhook.yaml
+```
+
+Images: `./prepare-image-context.sh && make images`. Both are stdlib-only
+Python with no pip dependency tree — deliberate, because the agent runs
+privileged in somebody else's cluster.
+
+```bash
+mncrctl status                       # nodes, jobs, recent epochs
+mncrctl checkpoint train-7           # or --mode stop, for preemption
+mncrctl epochs train-7
+mncrctl plan-restore ep-abc --nodes 4    # which nodes could host it, and why not
+mncrctl restore train-7 ep-abc --targets node-a=0,1 --targets node-b=2,3
+mncrctl gc train-7 --retain 3
+mncrctl preflight
+```
+
+Metrics are on `:9180` (agent) and `:9181` (coordinator). The series worth
+alerting on is the one that separates the two kinds of failure:
+
+```
+mncr_epochs_total{outcome="aborted"}   the job survived; something to fix
+mncr_epochs_total{outcome="failed"}    the job did not; restore an image
+mncr_stopped_seconds_bucket            how long the job was not running
+mncr_gate_findings_total{kind=...}     what ranks are still holding
 ```
 
 ```yaml
@@ -129,16 +193,30 @@ The field to read on failure is `status.jobIntact`. See [docs/runbook.md](docs/r
 
 ## What has and has not been exercised
 
-Everything in `make verify` runs here and passes: the phase model, the
-two-phase commit under eight injected faults, device maps, placement, the image
-pipeline round trip with checksums, a cross-node restore that has to fetch its
-shards back because the images were deleted from the target node, admission, and
-the full rank lifecycle across a simulated cluster.
+Proven by test here:
 
-Nothing has run against a GPU, a real driver, real CRIU, or a real cluster. The
-paths that need hardware are the CLI driver backend, the CRIU backend, the
-interposer, and the expandable-segments experiment. They are written and
-compile; they are not proven. P0 exists to prove them first.
+- the phase model and two-phase commit, under eight injected faults
+- device maps, placement, retention, policy suspension
+- the image pipeline round trip with checksums, and a cross-node restore that
+  has to fetch its shards back because the images were deleted from the target
+- the admission webhook, including its behaviour during an API outage
+- the interposer's recording, severity classification and `cuGetProcAddress`
+  redirect, against a stand-in driver
+- step agreement, teardown and communicator rebuild, against real gloo
+  collectives
+- the full rank lifecycle across a simulated cluster
+
+Not proven, because it needs hardware:
+
+- the `cuda-checkpoint` CLI backend and the CRIU backend — written, never run
+- the interposer against real CUDA — its logic is tested, its behaviour under a
+  real driver is not
+- NCCL-specific teardown — the gloo tests prove the shape, not the NVLS and
+  verbs releases that only NCCL performs
+- the expandable-segments question
+
+`make preflight` and `make smoke` are what close that list, and they are the
+first thing to run on a node.
 
 ## Known open question
 

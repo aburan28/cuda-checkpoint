@@ -1,0 +1,56 @@
+/*
+ * Calls every hooked entry point two ways: directly, and through the pointer
+ * cuGetProcAddress hands back. Both must show up in the audit log.
+ */
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef int CUresult;
+
+extern CUresult cuMemCreate(void *, size_t, const void *, unsigned long long);
+extern CUresult cuMemMap(unsigned long long, size_t, size_t, void *, unsigned long long);
+extern CUresult cuMemExportToShareableHandle(void *, void *, int, unsigned long long);
+extern CUresult cuMemAllocManaged(unsigned long long *, size_t, unsigned int);
+extern CUresult cuMulticastCreate(void *, const void *);
+extern CUresult cuIpcGetMemHandle(void *, unsigned long long);
+extern CUresult cuGetProcAddress(const char *, void **, int, uint64_t);
+
+typedef CUresult (*fn_create)(void *, size_t, const void *, unsigned long long);
+typedef CUresult (*fn_export)(void *, void *, int, unsigned long long);
+
+int main(void)
+{
+    void *handle = NULL;
+    unsigned long long ptr = 0;
+    char blob[64] = {0};
+
+    /* direct calls - the LD_PRELOAD path */
+    cuMemCreate(&handle, 1u << 20, NULL, 0);
+    cuMemMap(ptr, 1u << 20, 0, handle, 0);
+    cuMemExportToShareableHandle(blob, handle, 1, 0);
+    cuMemAllocManaged(&ptr, 4096, 1);
+    cuMulticastCreate(&handle, NULL);
+    cuIpcGetMemHandle(blob, ptr);
+
+    /* resolved calls - the cuGetProcAddress path, which is what NCCL uses */
+    fn_create resolved_create = NULL;
+    if (cuGetProcAddress("cuMemCreate", (void **)&resolved_create, 12080, 0) != 0) {
+        fprintf(stderr, "cuGetProcAddress(cuMemCreate) failed\n");
+        return 1;
+    }
+    resolved_create(&handle, 2u << 20, NULL, 0);
+
+    fn_export resolved_export = NULL;
+    if (cuGetProcAddress("cuMemExportToShareableHandle", (void **)&resolved_export,
+                         12080, 0) != 0) {
+        fprintf(stderr, "cuGetProcAddress(cuMemExportToShareableHandle) failed\n");
+        return 1;
+    }
+    /* handle type 8 is FABRIC in current headers: the MNNVL case */
+    resolved_export(blob, handle, 8, 0);
+
+    printf("probe done\n");
+    return 0;
+}

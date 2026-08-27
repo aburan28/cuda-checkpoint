@@ -9,8 +9,8 @@ state only the controller understood.
 import argparse
 import time
 
-from mncr import config, log
-from mncr.errors import AbortableError, TerminalError
+from mncr import config, log, metrics
+from mncr.errors import AbortableError, TerminalError, UnreleasedAbortError
 
 from .client import K8sClient
 
@@ -59,6 +59,23 @@ class Controller:
                 image_root=spec.get("imageRoot"),
                 reason=spec.get("reason", f"GpuCheckpoint/{name}"),
             )
+        except UnreleasedAbortError as exc:
+            # Aborted before the commit point, but a node could not be told
+            # to release its ranks: they are torn down and waiting. Nothing
+            # on a GPU was touched, and yet the job is not running.
+            self._set_status(
+                "gpucheckpoints",
+                name,
+                {
+                    "phase": "Failed",
+                    "reason": "AbortedUnreleased",
+                    "message": str(exc)[:900],
+                    "jobIntact": False,
+                    "finishedAt": _now(),
+                },
+            )
+            _LOG.error("checkpoint aborted with ranks unreleased", name=name, error=str(exc))
+            return
         except AbortableError as exc:
             # Nothing was lost. The job is still running.
             self._set_status(
@@ -144,6 +161,11 @@ class Controller:
         while the previous one is still uploading is worse than a late one."""
         name = obj["metadata"]["name"]
         spec = obj.get("spec", {})
+        status = obj.get("status", {})
+
+        if status.get("suspended"):
+            return
+
         interval = float(spec.get("intervalSeconds", 3600))
         last = self._policy_last.get(name, 0)
         if time.time() - last < interval:
@@ -155,27 +177,56 @@ class Controller:
             result = self.coord.checkpoint(
                 job_id, mode="continue", reason=f"CheckpointPolicy/{name}"
             )
-            self._set_status(
-                "checkpointpolicies",
-                name,
-                {
-                    "lastEpochId": result["epoch_id"],
-                    "lastCheckpointAt": _now(),
-                    "consecutiveFailures": 0,
-                },
-            )
         except Exception as exc:
-            failures = obj.get("status", {}).get("consecutiveFailures", 0) + 1
-            self._set_status(
-                "checkpointpolicies",
-                name,
-                {
-                    "lastError": str(exc)[:500],
-                    "consecutiveFailures": failures,
-                    "lastAttemptAt": _now(),
-                },
+            failures = status.get("consecutiveFailures", 0) + 1
+            limit = int(spec.get("suspendAfterFailures", 3))
+            update = {
+                "lastError": str(exc)[:500],
+                "consecutiveFailures": failures,
+                "lastAttemptAt": _now(),
+            }
+            metrics.POLICY_SUSPENDED.set(
+                1 if failures >= limit else 0, policy=name, job=job_id
             )
-            _LOG.warn("policy checkpoint failed", name=name, failures=failures)
+            if failures >= limit:
+                # Retrying a policy that has failed repeatedly turns one broken
+                # job into a source of load on every node it touches. Stop, and
+                # make the stop visible.
+                update["suspended"] = True
+                update["suspendedReason"] = (
+                    f"{failures} consecutive failures reached "
+                    f"suspendAfterFailures={limit}"
+                )
+                _LOG.error("policy suspended", name=name, failures=failures)
+            else:
+                _LOG.warn("policy checkpoint failed", name=name, failures=failures)
+            self._set_status("checkpointpolicies", name, update)
+            return
+
+        # A success ends the failure streak, and the gauge has to say so
+        # too, or a recovered policy reads as suspended forever.
+        metrics.POLICY_SUSPENDED.set(0, policy=name, job=job_id)
+        update = {
+            "lastEpochId": result["epoch_id"],
+            "lastCheckpointAt": _now(),
+            "consecutiveFailures": 0,
+        }
+        retain = int(spec.get("retain", 3))
+        try:
+            reclaimed = self.coord.gc(job_id, retain=retain)
+            update["retainedImages"] = len(reclaimed["kept"])
+            if reclaimed["deleted"]:
+                _LOG.info(
+                    "images reclaimed",
+                    name=name,
+                    deleted=len(reclaimed["deleted"]),
+                    retained=len(reclaimed["kept"]),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # Retention failing must not mark a successful checkpoint failed.
+            update["lastError"] = f"gc: {str(exc)[:300]}"
+            _LOG.warn("gc failed", name=name, error=str(exc))
+        self._set_status("checkpointpolicies", name, update)
 
     # ------------------------------------------------------------- helpers
     def _set_status(self, plural, name, status):
@@ -230,6 +281,7 @@ def main(argv=None):
     ap.add_argument("--namespace", default=None)
     ap.add_argument("--agents", default="", help="node=addr,node=addr")
     ap.add_argument("--interval", type=float, default=5.0)
+    ap.add_argument("--metrics-port", type=int, default=9181)
     args = ap.parse_args(argv)
 
     agents = {}
@@ -238,6 +290,8 @@ def main(argv=None):
         agents[node] = addr
 
     coord = Coordinator(config.load(), agents=agents)
+    if args.metrics_port:
+        metrics.serve(args.metrics_port)
     Controller(coord, namespace=args.namespace, poll_interval=args.interval).run()
     return 0
 

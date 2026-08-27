@@ -1,0 +1,99 @@
+name: verify
+
+# Everything here runs without a GPU. That is the point of the simulator: the
+# coordination logic is under test on every push, and only the hardware paths
+# wait for a node.
+
+on:
+  push:
+    branches: [main, "mncr-*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install check tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck zstd
+          python3 -m pip install --quiet pyyaml
+
+      - name: Compile, manifests, shell, C
+        working-directory: mncr
+        run: make check
+
+      - name: Unit and protocol tests
+        working-directory: mncr
+        run: make test
+
+      - name: Chaos matrix
+        working-directory: mncr
+        run: make chaos
+
+      - name: Scale ladder
+        working-directory: mncr
+        run: python3 -m verify.scale --repeats 2 --max-nodes 4 --max-ranks 4
+        env:
+          MNCR_LOG_LEVEL: error
+
+      - name: Allocation auditor, via the real LD_PRELOAD path
+        working-directory: mncr/audit/interpose
+        run: make test
+
+      - name: Smoke levels degrade cleanly without hardware
+        working-directory: mncr
+        run: |
+          python3 -m verify.smoke --json > smoke.json
+          python3 - <<'PY'
+          import json, sys
+          levels = json.load(open("smoke.json"))["levels"]
+          bad = [entry for entry in levels if entry["status"] == "FAIL"]
+          for entry in levels:
+              print(f"{entry['level']} {entry['name']}: {entry['status']}")
+          sys.exit(1 if bad else 0)
+          PY
+
+  collectives:
+    # The consistent-cut mechanism only means anything against a real process
+    # group. gloo on CPU gives us one without a GPU, so this is the job that
+    # proves ranks agree on a step and that a torn-down group comes back.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install torch (CPU only)
+        run: |
+          python3 -m pip install --quiet \
+            --index-url https://download.pytorch.org/whl/cpu torch
+      - name: Step agreement and communicator rebuild
+        working-directory: mncr
+        run: python3 -m unittest tests.test_collectives -v
+        env:
+          MNCR_LOG_LEVEL: error
+
+  images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage the vendor binary
+        working-directory: mncr
+        run: ./prepare-image-context.sh x86_64
+      - name: Build control image
+        working-directory: mncr
+        run: docker build --target control -t mncr-control:ci .
+      - name: Build agent image
+        working-directory: mncr
+        run: docker build --target agent -t mncr-agent:ci .

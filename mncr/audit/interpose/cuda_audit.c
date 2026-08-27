@@ -181,14 +181,29 @@ __attribute__((constructor)) static void audit_init(void)
 
 static void *real_sym(const char *name)
 {
-    /* RTLD_NEXT covers the LD_PRELOAD case. The explicit dlopen below is the
-     * fallback for when we are called before the loader has us in the chain,
-     * which happens on the cuGetProcAddress path. */
+    /* RTLD_NEXT covers the LD_PRELOAD case, which is how this runs in
+     * production. The explicit dlopen is the fallback for everything else: a
+     * libcuda at a non-standard path, and the test rig, which points
+     * MNCR_AUDIT_REAL_LIB at a stand-in so the interposer can be exercised
+     * without a driver. */
     void *fn = dlsym(RTLD_NEXT, name);
     if (!fn) {
         static void *libcuda;
-        if (!libcuda)
-            libcuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+        static int tried;
+        if (!tried) {
+            const char *path = getenv("MNCR_AUDIT_REAL_LIB");
+            libcuda = dlopen(path ? path : "libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+            tried = 1;
+            if (!libcuda && g_out) {
+                pthread_mutex_lock(&g_lock);
+                fprintf(g_out,
+                        "{\"event\":\"error\",\"message\":\"cannot resolve the "
+                        "real CUDA entry points\",\"tried\":\"%s\"}\n",
+                        path ? path : "libcuda.so.1");
+                fflush(g_out);
+                pthread_mutex_unlock(&g_lock);
+            }
+        }
         if (libcuda)
             fn = dlsym(libcuda, name);
     }

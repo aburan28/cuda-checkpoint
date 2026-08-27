@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 *.so
 /audit/interpose/cuda_audit.so
+vendor-bin/
+/audit/interpose/test/probe
+/audit/interpose/test/libfakecuda.*
+*.dSYM/

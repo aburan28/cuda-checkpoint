@@ -1,0 +1,60 @@
+# The validating webhook, and the certificate it needs.
+#
+# failurePolicy on the ValidatingWebhookConfiguration is Ignore, so an outage
+# here degrades to "checkpointable pods may schedule anywhere" rather than
+# "nothing schedules". That is the right trade: the webhook prevents a job from
+# landing where it cannot be checkpointed, which is a problem discovered at the
+# first epoch, not an outage.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mncr-admission
+  namespace: mncr-system
+  labels: {app: mncr-admission}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: mncr-admission}
+  template:
+    metadata:
+      labels: {app: mncr-admission}
+    spec:
+      serviceAccountName: mncr-coordinator
+      containers:
+        - name: admission
+          image: ghcr.io/example/mncr-control:0.1.0
+          command: [python3, -m, k8s.admission_server]
+          args: ["--port", "8443"]
+          ports:
+            - {name: https, containerPort: 8443}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8443, scheme: HTTPS}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8443, scheme: HTTPS}
+            periodSeconds: 30
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+      volumes:
+        - name: tls
+          secret:
+            secretName: mncr-admission-tls
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mncr-admission
+  namespace: mncr-system
+spec:
+  selector: {app: mncr-admission}
+  ports:
+    - {name: https, port: 443, targetPort: 8443}

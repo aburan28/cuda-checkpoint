@@ -29,6 +29,9 @@ spec:
         - name: Failures
           type: integer
           jsonPath: .status.consecutiveFailures
+        - name: Suspended
+          type: boolean
+          jsonPath: .status.suspended
       schema:
         openAPIV3Schema:
           type: object
@@ -65,3 +68,13 @@ spec:
                   type: string
                 consecutiveFailures:
                   type: integer
+                retainedImages:
+                  type: integer
+                suspended:
+                  type: boolean
+                  description: >-
+                    Set once consecutiveFailures reaches suspendAfterFailures.
+                    Clear it by hand once the cause is fixed; retrying a broken
+                    policy turns one job into load on every node it touches.
+                suspendedReason:
+                  type: string

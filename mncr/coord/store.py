@@ -83,6 +83,31 @@ class EpochStore:
         except FileNotFoundError:
             return None
 
+    def mark_pruned(self, epoch_id):
+        """Record that an epoch's images are gone.
+
+        The record stays: knowing an image once existed and was reclaimed is
+        worth a few hundred bytes when someone asks where it went.
+        """
+        epoch = self.get(epoch_id)
+        if epoch is None:
+            return None
+        epoch["pruned"] = True
+        epoch["pruned_at"] = time.time()
+        return self.put(epoch)
+
+    def retained(self, job_id):
+        """Epochs for this job that still have images, newest first."""
+        return sorted(
+            (
+                e
+                for e in self.list_epochs(job_id)
+                if e.get("image_id") and not e.get("pruned")
+            ),
+            key=lambda e: e.get("created_at", 0),
+            reverse=True,
+        )
+
     def in_flight(self):
         """Epochs that were not finished. Split by whether they committed."""
         recoverable, lost = [], []

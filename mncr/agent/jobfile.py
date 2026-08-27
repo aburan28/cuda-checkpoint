@@ -58,7 +58,12 @@ class JobFiles:
             "-c",
             f'cp "${ENV_VAR}" "{dest}"',
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except FileNotFoundError as exc:
+            raise DriverError(f"{self.binary} not found on PATH") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise DriverError("job file creation timed out") from exc
         if proc.returncode != 0 or not os.path.exists(dest):
             raise DriverError(
                 f"job file creation failed rc={proc.returncode}: "

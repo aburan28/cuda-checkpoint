@@ -65,10 +65,14 @@ class LocalBackend(Backend):
 class RemoteBackend(Backend):
     """Generic CLI backend. `template` uses {src} and {dst} placeholders."""
 
-    def __init__(self, prefix, put_template=None, get_template=None, timeout=3600):
+    def __init__(self, prefix, put_template=None, get_template=None, timeout=3600,
+                 delete_template=None):
         self.prefix = prefix.rstrip("/")
         self.put_template = put_template or "aws s3 cp {src} {dst}"
         self.get_template = get_template or "aws s3 cp {src} {dst}"
+        # Retention has to reach the object store too, or the bytes it
+        # reclaims on NVMe live on forever behind it. {dst} is the object.
+        self.delete_template = delete_template or "aws s3 rm {dst}"
         self.timeout = timeout
 
     def _url(self, key):
@@ -95,7 +99,8 @@ class RemoteBackend(Backend):
         return False   # the cache layer treats unknown as a miss
 
     def delete(self, key):
-        return False
+        self._run(self.delete_template, "", self._url(key))
+        return True
 
 
 class TieredBackend(Backend):
@@ -126,4 +131,13 @@ class TieredBackend(Backend):
         return self.local.exists(key) or (self.remote and self.remote.exists(key))
 
     def delete(self, key):
-        return self.local.delete(key)
+        """Both tiers. A remote failure is logged and reported, not raised:
+        the sweep must finish, and the epoch stays unpruned to be retried."""
+        removed = self.local.delete(key)
+        if self.remote:
+            try:
+                removed = self.remote.delete(key) or removed
+            except Exception as exc:  # noqa: BLE001
+                _LOG.warn("remote delete failed", key=key, error=str(exc))
+                raise
+        return removed
