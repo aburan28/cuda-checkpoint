@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.so
+/audit/interpose/cuda_audit.so

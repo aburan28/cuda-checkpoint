@@ -1,0 +1,58 @@
+# A checkpointable rank pod. Three things make it checkpointable, and all three
+# are load-bearing:
+#
+#   the label            admission requires checkpointable pods to be pinned to
+#                        checkpointable nodes
+#   the control mount    the rank polls /run/mncr for its epoch request; the
+#                        agent writes it there. hostPath, because agent and rank
+#                        are different pods
+#   the job file env     driver 610 IPC needs it, and the agent creates the file
+#
+# expandable_segments is off until P0's experiment says otherwise: it allocates
+# through the VMM API, which the checkpoint path does not support.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: trainer-rank-0
+  labels:
+    mncr.io/checkpointable: "true"
+    job-name: train-7
+spec:
+  nodeSelector:
+    mncr.io/checkpointable: "true"
+  restartPolicy: Never
+  containers:
+    - name: trainer
+      image: ghcr.io/example/trainer:latest
+      command: [python3, train.py]
+      env:
+        - name: MNCR_JOB_ID
+          value: train-7
+        - name: MNCR_CONTROL_ROOT
+          value: /run/mncr
+        - name: MNCR_RANK_ADDR
+          value: unix:/run/mncr/agent.sock
+        - name: RANK
+          value: "0"
+        - name: WORLD_SIZE
+          value: "32"
+        - name: CUDA_CHECKPOINT_JOB_FILE
+          value: /run/mncr/jobs/train-7.jobfile
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: "expandable_segments:False"
+      resources:
+        limits: {nvidia.com/gpu: 8}
+      volumeMounts:
+        - {name: control, mountPath: /run/mncr}
+  volumes:
+    - name: control
+      hostPath: {path: /run/mncr, type: DirectoryOrCreate}
+---
+apiVersion: mncr.io/v1alpha1
+kind: CheckpointPolicy
+metadata:
+  name: train-7-hourly
+spec:
+  jobId: train-7
+  intervalSeconds: 3600
+  retain: 3
