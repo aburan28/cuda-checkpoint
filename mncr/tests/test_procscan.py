@@ -51,10 +51,29 @@ class TestProcScan(unittest.TestCase):
         kinds = {f.kind for f in ProcScanner(root).blocking(4, Severity.BEFORE_DUMP)}
         self.assertEqual(kinds, {"verbs_fd", "nvidia_fd"})
 
-    def test_uvm_mapping_detected(self):
-        root = build_proc(self.tmp, 5, maps=["/dev/nvidia-uvm"])
-        findings = ProcScanner(root).blocking(5, Severity.BEFORE_LOCK)
-        self.assertEqual([f.kind for f in findings], ["uvm_mapping"])
+    def test_uvm_is_normal_before_the_lock(self):
+        """Every CUDA process holds these, measured on real hardware.
+
+        Treating them as a pre-lock blocker rejected a process that checkpoints
+        and restores perfectly.
+        """
+        root = build_proc(
+            self.tmp, 5, fds=["/dev/nvidia-uvm"], maps=["/dev/nvidia-uvm"]
+        )
+        scanner = ProcScanner(root)
+        self.assertEqual(scanner.blocking(5, Severity.BEFORE_LOCK), [])
+        kinds = {f.kind for f in scanner.blocking(5, Severity.BEFORE_DUMP)}
+        self.assertEqual(kinds, {"uvm_fd", "uvm_mapping"})
+
+    def test_an_ordinary_cuda_process_passes_the_lock_gate(self):
+        """The shape of a real CUDA process: device fds, control fd, uvm."""
+        root = build_proc(
+            self.tmp,
+            8,
+            fds=["/dev/nvidia0", "/dev/nvidiactl", "/dev/nvidia-uvm"],
+            maps=["/dev/nvidia0", "/dev/nvidia-uvm"],
+        )
+        self.assertEqual(ProcScanner(root).blocking(8, Severity.BEFORE_LOCK), [])
 
     def test_gdrcopy_and_summary(self):
         root = build_proc(self.tmp, 6, fds=["/dev/gdrdrv", "/dev/infiniband/rdma_cm"])

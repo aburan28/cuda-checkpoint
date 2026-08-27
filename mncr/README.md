@@ -63,9 +63,15 @@ otherwise only testable on hardware:
 
 - **The interposer runs against a stand-in driver.** `make check` builds
   `cuda_audit.so`, loads it over a fake libcuda and asserts what it recorded —
-  including that a call resolved through `cuGetProcAddress` went through the
-  wrapper. Interposing the symbol alone would pass a naive test and silently
-  miss every allocation NCCL makes.
+  including that calls resolved through `cuGetProcAddress` and through
+  `dlsym` on a handle both went through the wrapper. Interposing the symbol
+  alone would pass a naive test and miss how frameworks actually reach libcuda.
+  Measured against real torch it saw nothing; review found why - torch resolves
+  everything through a `cuGetProcAddress` it obtains by `dlsym`, and the hook
+  handed back the driver's resolver - and that path is now hooked and tested
+  against the stand-in driver, but not yet re-measured against torch. Until it
+  is, an empty report is not proof of a clean workload —
+  [findings](docs/findings-595-blackwell.md).
 - **Step agreement runs against a real process group.** gloo on CPU gives real
   collectives without a GPU, so `tests/test_collectives.py` proves ranks
   arriving at different local steps all stop at the same one, and that a torn
@@ -124,12 +130,17 @@ agree on a step to stop at, and keep training until they all reach it.
 
 ## On a GPU node
 
-Two commands stand between the simulator and real hardware. Run them in order.
-
 ```bash
+sudo ./bootstrap-node.sh --cuda-checkpoint ../bin/x86_64_Linux/cuda-checkpoint
 make preflight      # can this node participate? uses the real backends
 make smoke          # four levels: driver, +criu, +agent, +full epoch
 ```
+
+`bootstrap-node.sh` installs the utility, builds CRIU with its CUDA plugin (no
+distro ships 4.x with it, and the plugin is the whole point), and ends by
+running preflight. It is idempotent, so it belongs in cloud-init or a DaemonSet
+init container — which matters more than it sounds: a spot node reclaimed
+mid-session takes a hand-built CRIU with it.
 
 `preflight` checks tooling, driver and CRIU versions, the CUDA plugin,
 privileges, host RAM against device memory, and actually creates a job file. It
@@ -206,23 +217,44 @@ Proven by test here:
   collectives
 - the full rank lifecycle across a simulated cluster
 
-Not proven, because it needs hardware:
+Proven on real hardware — driver 595.91.07, RTX PRO 6000 Blackwell, CRIU 4.2.1:
 
-- the `cuda-checkpoint` CLI backend and the CRIU backend — written, never run
-- the interposer against real CUDA — its logic is tested, its behaviour under a
-  real driver is not
+- all four `make smoke` levels: driver, +CRIU, +agent, +full coordinator epoch,
+  with device memory verified by checksum at each
+- the `cuda-checkpoint` CLI backend and the CRIU backend
+- the interposer under the production `LD_PRELOAD` path
+- `make preflight` against a node that really does fail one of its checks
+
+Still not proven:
+
 - NCCL-specific teardown — the gloo tests prove the shape, not the NVLS and
-  verbs releases that only NCCL performs
-- the expandable-segments question
+  verbs releases only NCCL performs
+- multi-GPU, NVLS multicast, fabric handles, driver 610
+- restore onto a *different* node (this was one machine)
 
-`make preflight` and `make smoke` are what close that list, and they are the
-first thing to run on a node.
+See [docs/findings-595-blackwell.md](docs/findings-595-blackwell.md), which
+includes the three production bugs that only hardware exposed.
 
-## Known open question
+## Measured on hardware
 
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` allocates through
-`cuMemCreate`/`cuMemMap`. The documented limitation names the *export*, not the
-allocation. Whether the driver rejects a process merely holding VMM allocations
-decides a fleet-wide policy, and it is not answerable from documentation. Run
-`audit/experiments/expandable_segments.py` on one real node before designing
-around either answer. Until then the manifests set it to `False`.
+The plan's biggest open question is answered. Full results in
+[docs/findings-595-blackwell.md](docs/findings-595-blackwell.md); the two that
+change decisions:
+
+**Expandable segments are fine.** A process merely holding `cuMemCreate` /
+`cuMemMap` allocations checkpoints and restores cleanly on driver 595. The
+manifests no longer force `expandable_segments:False`.
+
+**Exporting is fine; importing is fatal.** The vendor documentation says the
+utility "does not support ... IPC memory created with
+`cuMemExportToShareableHandle()`". Measured, that splits: the *exporting*
+process checkpoints and restores fine even while a peer maps the memory, while
+the *importing* process checkpoints and then fails to restore with `"invalid
+argument"` — past the commit point, and unrecoverable afterwards. Tested in both
+restore orders, so it is the sharing, not the documented ordering rule.
+
+NCCL ranks import each other's handles, so communicator teardown before the lock
+is **required**, not merely tidy. And the failure landing after the commit point
+is this system's central asymmetry, observed rather than argued.
+
+Caveats: driver 595 on a single Blackwell GPU. 610 and multi-GPU are unmeasured.

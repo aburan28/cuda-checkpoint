@@ -13,7 +13,9 @@ import os
 import sys
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
+sys.path.insert(0, HERE)
 
 import torchckpt  # noqa: E402
 
@@ -79,15 +81,24 @@ def main():
         collective["dist"] = dist
 
     if args.cuda:
-        import torch
+        # Torch when it is there, the driver API when it is not. Either way the
+        # rank is a genuine CUDA process, which is what cuda-checkpoint needs.
+        try:
+            import torch
 
-        if not torch.cuda.is_available():
-            raise SystemExit("--cuda requested but no CUDA device is available")
-        device_state["expected"] = torch.arange(
-            1 << 20, dtype=torch.int64, device="cuda"
-        )
-        device_state["buffer"] = device_state["expected"].clone()
-        torch.cuda.synchronize()
+            if not torch.cuda.is_available():
+                raise ImportError("no CUDA device visible to torch")
+            device_state["kind"] = "torch"
+            device_state["expected"] = torch.arange(
+                1 << 20, dtype=torch.int64, device="cuda"
+            )
+            device_state["buffer"] = device_state["expected"].clone()
+            torch.cuda.synchronize()
+        except ImportError:
+            from cuda_ctypes import DeviceBuffer
+
+            device_state["kind"] = "driver-api"
+            device_state["buffer"] = DeviceBuffer(8 << 20)
 
     torchckpt.init(
         job_id=args.job_id,
@@ -112,13 +123,15 @@ def main():
     @torchckpt.on_resume
     def rebuild(ctx):
         intact = None
-        if device_state:
+        if device_state.get("kind") == "torch":
             import torch
 
             intact = bool(
                 (device_state["buffer"] == device_state["expected"]).all().item()
             )
             torch.cuda.synchronize()
+        elif device_state.get("kind") == "driver-api":
+            intact = bool(device_state["buffer"].intact())
         rejoined = None
         if collective:
             dist = collective["dist"]

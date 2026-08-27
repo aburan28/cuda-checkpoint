@@ -82,7 +82,7 @@ def check_tooling(cfg):
     return check
 
 
-def check_driver():
+def check_driver(require_ipc=True):
     check = Check("driver")
     code, out = _run(["nvidia-smi", "--query-gpu=driver_version,name,persistence_mode",
                       "--format=csv,noheader"])
@@ -99,9 +99,18 @@ def check_driver():
     except ValueError:
         major = -1
     if major < MIN_DRIVER:
-        check.blocker(
-            f"driver {version} is below the minimum {MIN_DRIVER}", driver=version
+        # Measured on 595: single-process checkpoint, restore and --device-map
+        # all work; what is missing is job-file IPC, which arrives at 610. So
+        # this blocks only a fleet that needs multi-process IPC.
+        message = (
+            f"driver {version} is below {MIN_DRIVER}: single-process "
+            f"checkpoint/restore and --device-map work, but job-file IPC does "
+            f"not, and cuIpcGetMemHandle memory cannot be checkpointed"
         )
+        if require_ipc:
+            check.blocker(message, driver=version)
+        else:
+            check.warning(message, driver=version)
     else:
         check.info(f"driver {version}", gpus=len(rows))
     if not any("Enabled" in r for r in rows):
@@ -276,13 +285,13 @@ def check_target(cfg, pid):
     return check
 
 
-def run(cfg=None, target_pid=None, skip=()):
+def run(cfg=None, target_pid=None, skip=(), require_ipc=True):
     cfg = cfg or config.load()
     checks = []
     if "tooling" not in skip:
         checks.append(check_tooling(cfg))
     if "driver" not in skip:
-        checks.append(check_driver())
+        checks.append(check_driver(require_ipc=require_ipc))
     if "criu" not in skip:
         checks.append(check_criu(cfg))
     if "privileges" not in skip:
@@ -337,10 +346,20 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="validate a node against the real backends")
     ap.add_argument("--pid", type=int, default=None, help="also check a running CUDA process")
     ap.add_argument("--skip", default="", help="comma-separated checks to skip")
+    ap.add_argument(
+        "--no-ipc",
+        action="store_true",
+        help="the job does not use multi-process CUDA IPC, so a driver below "
+             "610 is a warning rather than a blocker",
+    )
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
-    report = run(target_pid=args.pid, skip=set(filter(None, args.skip.split(","))))
+    report = run(
+        target_pid=args.pid,
+        skip=set(filter(None, args.skip.split(","))),
+        require_ipc=not args.no_ipc,
+    )
     print(json.dumps(report, indent=2) if args.json else render(report))
     return 1 if report["verdict"] == "no-go" else 0
 

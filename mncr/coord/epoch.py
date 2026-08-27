@@ -223,6 +223,9 @@ class EpochRunner:
             job_id=job_id,
             epoch_id=epoch["epoch_id"],
             image_root=image_root,
+            # Keeping the job running is the whole point of mode="continue",
+            # and criu kills what it dumps unless told otherwise.
+            leave_running=(mode == "continue"),
             _timeout=self.cfg.dump_timeout,
         )
         if errors:

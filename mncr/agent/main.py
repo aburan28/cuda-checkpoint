@@ -331,14 +331,26 @@ class Agent:
 
     # ------------------------------------------------------------------ dump
     def dump(self, job_id, epoch_id, image_root, ranks=None, external=None,
-             store=True):
+             store=True, leave_running=False):
+        """Write the images.
+
+        leave_running is not a detail: criu dump kills the process unless it is
+        set. A checkpoint-and-continue that omits it takes a perfectly good
+        image and kills every rank that produced it - which the fake backend
+        cannot show you, because it never killed anything.
+        """
         local = self._registered_ranks(job_id, ranks)
         images, entries = [], []
         for record in local:
             pid = record["host_pid"]
             self._gate(self.verifier.before_dump, pid, "before_dump")
             images_dir = os.path.join(image_root, epoch_id, f"rank-{record['rank']}")
-            self.criu.dump(pid, images_dir, external=external or ())
+            self.criu.dump(
+                pid,
+                images_dir,
+                leave_running=leave_running,
+                external=external or (),
+            )
             images.append({"rank": record["rank"], "path": images_dir, "pid": pid})
             entries.append(
                 {
@@ -408,8 +420,7 @@ class Agent:
                 self._adopt(job_id, record, pid)
             else:
                 pid = record["host_pid"]
-            self.driver.restore(pid, device_map=device_map)
-            self.driver.unlock(pid)
+            self._finish_restore(pid, device_map)
             restored.append(pid)
 
         self._release(
@@ -522,6 +533,11 @@ class Agent:
                     gate=gate, kind=finding.kind, node=self.node
                 )
             raise
+
+    def _finish_restore(self, pid, device_map):
+        """Delegate to the shared resume logic, which knows what criu already did."""
+        return driver_mod.resume(pid=pid, backend=self.driver,
+                                 device_map=device_map, log=_LOG)
 
     def _restore_targets(self, job_id, ranks, from_images):
         """Records to restore.

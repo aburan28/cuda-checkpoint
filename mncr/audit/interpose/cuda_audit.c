@@ -21,12 +21,24 @@
  *                                       but only within a launched job, so it
  *                                       is worth knowing about.
  *
- * Interposing on the symbols alone is not enough. Since CUDA 12 the runtime and
- * NCCL resolve driver entry points through cuGetProcAddress, which returns a
- * pointer straight out of libcuda and never touches our PLT entry. So we hook
- * cuGetProcAddress as well and hand back our wrappers by name. Missing this is
- * the difference between "the audit came back clean" and "the audit saw
- * nothing".
+ * Interposing on the symbols alone is not enough, and this was measured rather
+ * than assumed - a real PyTorch + NCCL process under LD_PRELOAD recorded
+ * absolutely nothing. There are two bypasses, and both have to be closed:
+ *
+ *   cuGetProcAddress   since CUDA 12 the runtime resolves driver entry points
+ *                      through it, getting a pointer straight out of libcuda
+ *                      that never touches our PLT entry.
+ *
+ *   dlopen + dlsym     PyTorch and NCCL do not link libcuda at all. They
+ *                      dlopen("libcuda.so.1") and dlsym each function off that
+ *                      handle, which resolves inside the library and skips the
+ *                      global symbol table where LD_PRELOAD does its work. This
+ *                      is the one that matters: it is how the frameworks people
+ *                      actually run reach the driver.
+ *
+ * So we hook both. Missing either is the difference between "the audit came
+ * back clean" and "the audit saw nothing", and those look identical in a
+ * report.
  *
  * Build:  make
  * Use:    MNCR_AUDIT_OUT=/tmp/audit.jsonl LD_PRELOAD=./cuda_audit.so ./your_app
@@ -76,6 +88,7 @@ static struct {
     unsigned long count;
 } g_counts[] = {
     {"cuMemCreate", 0},
+    {"cuMemAddressReserve", 0},
     {"cuMemMap", 0},
     {"cuMemExportToShareableHandle", 0},
     {"cuMemImportFromShareableHandle", 0},
@@ -177,7 +190,48 @@ __attribute__((constructor)) static void audit_init(void)
     atexit(emit_summary);
 }
 
+static void *redirect_for(const char *symbol);
+
 /* ----------------------------------------------------------------- helpers */
+
+/* ------------------------------------------------- the real dlsym, and ours */
+
+static void *(*g_real_dlsym)(void *, const char *);
+
+#ifdef __GLIBC__
+#define MNCR_HOOK_DLSYM 1
+#endif
+
+#ifdef MNCR_HOOK_DLSYM
+/* Bootstrapping problem: we cannot use dlsym to find dlsym, because ours is the
+ * one that would be found. dlvsym is not interposed, so it can do the lookup -
+ * but it needs the symbol version, and dl functions moved into libc at glibc
+ * 2.34. Try the versions that actually occur rather than guessing one. */
+static void init_real_dlsym(void)
+{
+    static const char *versions[] = {
+        "GLIBC_2.34",   /* glibc >= 2.34, dl merged into libc */
+        "GLIBC_2.2.5",  /* x86_64 libdl */
+        "GLIBC_2.17",   /* aarch64 libdl */
+        "GLIBC_2.4",
+    };
+    if (g_real_dlsym)
+        return;
+    for (size_t i = 0; i < sizeof versions / sizeof versions[0]; i++) {
+        g_real_dlsym = dlvsym(RTLD_NEXT, "dlsym", versions[i]);
+        if (g_real_dlsym)
+            return;
+    }
+}
+#else
+/* No LD_PRELOAD interposition to defend against here, so the plain one will do.
+ * macOS builds exist only so the logic can be tested off a Linux box. */
+static void init_real_dlsym(void)
+{
+    if (!g_real_dlsym)
+        g_real_dlsym = dlsym;
+}
+#endif
 
 static void *real_sym(const char *name)
 {
@@ -186,7 +240,10 @@ static void *real_sym(const char *name)
      * libcuda at a non-standard path, and the test rig, which points
      * MNCR_AUDIT_REAL_LIB at a stand-in so the interposer can be exercised
      * without a driver. */
-    void *fn = dlsym(RTLD_NEXT, name);
+    init_real_dlsym();
+    /* Our own lookups must use the real dlsym, or they find our wrappers and
+     * recurse until the stack runs out. */
+    void *fn = g_real_dlsym ? g_real_dlsym(RTLD_NEXT, name) : NULL;
     if (!fn) {
         static void *libcuda;
         static int tried;
@@ -204,8 +261,8 @@ static void *real_sym(const char *name)
                 pthread_mutex_unlock(&g_lock);
             }
         }
-        if (libcuda)
-            fn = dlsym(libcuda, name);
+        if (libcuda && g_real_dlsym)
+            fn = g_real_dlsym(libcuda, name);
     }
     return fn;
 }
@@ -226,9 +283,28 @@ CUresult cuMemCreate(CUmemGenericAllocationHandle *h, size_t size,
 {
     REAL("cuMemCreate", fn_memcreate);
     char detail[64];
+    /* Measured on 595: holding VMM allocations does not stop a checkpoint.
+     * Recorded because it is worth knowing which process has them - the
+     * blocker is importing someone else's, not creating your own. */
     snprintf(detail, sizeof detail, "bytes=%zu", size);
-    record("cuMemCreate", "blocker", detail);
+    record("cuMemCreate", "conditional", detail);
     return real(h, size, prop, flags);
+}
+
+/* Address reservation is the first call any VMM allocation makes. Watching it
+ * separates "this process does not use the VMM API" from "our hooks are not
+ * firing" - two very different conclusions that an empty report cannot tell
+ * apart. */
+typedef CUresult (*fn_addrreserve)(CUdeviceptr *, size_t, size_t, CUdeviceptr,
+                                   unsigned long long);
+CUresult cuMemAddressReserve(CUdeviceptr *ptr, size_t size, size_t alignment,
+                             CUdeviceptr addr, unsigned long long flags)
+{
+    REAL("cuMemAddressReserve", fn_addrreserve);
+    char detail[64];
+    snprintf(detail, sizeof detail, "bytes=%zu", size);
+    record("cuMemAddressReserve", "conditional", detail);
+    return real(ptr, size, alignment, addr, flags);
 }
 
 typedef CUresult (*fn_memmap)(CUdeviceptr, size_t, size_t,
@@ -237,7 +313,7 @@ CUresult cuMemMap(CUdeviceptr ptr, size_t size, size_t offset,
                   CUmemGenericAllocationHandle h, unsigned long long flags)
 {
     REAL("cuMemMap", fn_memmap);
-    record("cuMemMap", "blocker", "vmm mapping");
+    record("cuMemMap", "conditional", "vmm mapping");
     return real(ptr, size, offset, h, flags);
 }
 
@@ -249,9 +325,14 @@ CUresult cuMemExportToShareableHandle(void *out, CUmemGenericAllocationHandle h,
     REAL("cuMemExportToShareableHandle", fn_export);
     char detail[64];
     /* handle type 0x1 = POSIX fd, 0x8 = FABRIC in current headers. Recorded
-     * numerically so the report can name it without us guessing here. */
+     * numerically so the report can name it without us guessing here.
+     *
+     * Measured on 595: the exporting process checkpoints and restores fine
+     * even while a peer maps the memory. It is the importer that cannot be
+     * restored. So this is conditional, and the import below is the blocker.
+     * See docs/findings-595-blackwell.md. */
     snprintf(detail, sizeof detail, "handle_type=%d", handle_type);
-    record("cuMemExportToShareableHandle", "blocker", detail);
+    record("cuMemExportToShareableHandle", "conditional", detail);
     return real(out, h, handle_type, flags);
 }
 
@@ -261,6 +342,9 @@ CUresult cuMemImportFromShareableHandle(CUmemGenericAllocationHandle *h,
 {
     REAL("cuMemImportFromShareableHandle", fn_import);
     char detail[64];
+    /* The measured failure mode, and it is the worst kind: the checkpoint
+     * succeeds and the restore does not, past the point where anything can be
+     * undone. */
     snprintf(detail, sizeof detail, "handle_type=%d", handle_type);
     record("cuMemImportFromShareableHandle", "blocker", detail);
     return real(h, osh, handle_type);
@@ -321,6 +405,7 @@ struct redirect {
 
 static const struct redirect g_redirects[] = {
     {"cuMemCreate", (void *)cuMemCreate},
+    {"cuMemAddressReserve", (void *)cuMemAddressReserve},
     {"cuMemMap", (void *)cuMemMap},
     {"cuMemExportToShareableHandle", (void *)cuMemExportToShareableHandle},
     {"cuMemImportFromShareableHandle", (void *)cuMemImportFromShareableHandle},
@@ -342,13 +427,60 @@ static void *redirect_for(const char *symbol)
     return NULL;
 }
 
+#ifdef MNCR_HOOK_DLSYM
+/* The bypass that matters. PyTorch and NCCL dlopen libcuda and dlsym their way
+ * in; without this hook an audit of either comes back empty and reads as clean. */
+CUresult cuGetProcAddress(const char *symbol, void **pfn, int cuda_version,
+                          uint64_t flags);
+CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cuda_version,
+                             uint64_t flags, void *status);
+
+/*
+ * The entry point that hands out entry points has to be ours too. PyTorch and
+ * NCCL dlsym("cuGetProcAddress") once and resolve everything else through the
+ * pointer they get back; if that pointer is the driver's, every later lookup
+ * lands inside libcuda and the table above is never consulted. Measured: a
+ * torch workload with expandable segments engaged recorded nothing at all.
+ */
+static void *proc_address_wrapper(const char *symbol, int cuda_version)
+{
+    if (strcmp(symbol, "cuGetProcAddress_v2") == 0)
+        return (void *)cuGetProcAddress_v2;
+    if (strcmp(symbol, "cuGetProcAddress") == 0)
+        return cuda_version >= 12000 ? (void *)cuGetProcAddress_v2
+                                     : (void *)cuGetProcAddress;
+    return NULL;
+}
+
+void *dlsym(void *handle, const char *symbol)
+{
+    init_real_dlsym();
+    if (!g_real_dlsym) {
+        /* Nothing safe to do: returning NULL would break the caller. */
+        return NULL;
+    }
+    void *ours = proc_address_wrapper(symbol, 0);
+    if (!ours && strcmp(symbol, "cuGetProcAddress") == 0)
+        ours = (void *)cuGetProcAddress;
+    if (!ours)
+        ours = redirect_for(symbol);
+    if (ours) {
+        record("dlsym", "info", symbol);
+        return ours;
+    }
+    return g_real_dlsym(handle, symbol);
+}
+#endif
+
 typedef CUresult (*fn_getproc)(const char *, void **, int, uint64_t);
 CUresult cuGetProcAddress(const char *symbol, void **pfn, int cuda_version,
                           uint64_t flags)
 {
     REAL("cuGetProcAddress", fn_getproc);
     CUresult rc = real(symbol, pfn, cuda_version, flags);
-    void *ours = redirect_for(symbol);
+    void *ours = proc_address_wrapper(symbol, cuda_version);
+    if (!ours)
+        ours = redirect_for(symbol);
     if (rc == 0 && ours && pfn) {
         record("cuGetProcAddress", "info", symbol);
         *pfn = ours;
@@ -362,7 +494,9 @@ CUresult cuGetProcAddress_v2(const char *symbol, void **pfn, int cuda_version,
 {
     REAL("cuGetProcAddress_v2", fn_getproc2);
     CUresult rc = real(symbol, pfn, cuda_version, flags, status);
-    void *ours = redirect_for(symbol);
+    void *ours = proc_address_wrapper(symbol, cuda_version);
+    if (!ours)
+        ours = redirect_for(symbol);
     if (rc == 0 && ours && pfn) {
         record("cuGetProcAddress", "info", symbol);
         *pfn = ours;

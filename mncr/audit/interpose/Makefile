@@ -26,14 +26,16 @@ ifeq ($(UNAME),Darwin)
   # itself to Linux, where it is the production path and CI exercises it.
   PROBE_LIBS = $(CURDIR)/cuda_audit.$(SO) $(CURDIR)/test/libfakecuda.$(SO)
   RUN_ENV    = MNCR_AUDIT_REAL_LIB=$(CURDIR)/test/libfakecuda.$(SO)
-  MODE       := direct-link
+  MODE        := direct-link
+  EXPECT_ARGS :=
 else
   SO     := so
   SHARED := -shared
   # The production mechanism, unmodified.
   PROBE_LIBS = -L$(CURDIR)/test -lfakecuda
   RUN_ENV    = LD_PRELOAD=$(CURDIR)/cuda_audit.$(SO)
-  MODE       := LD_PRELOAD
+  MODE        := LD_PRELOAD
+  EXPECT_ARGS := --expect-dlsym-hook
 endif
 
 ifeq ($(USE_CUDA_H),1)
@@ -53,15 +55,15 @@ test/libfakecuda.$(SO): test/fake_libcuda.c
 	$(CC) $(CFLAGS) $(SHARED) -o $@ $<
 
 test/probe: test/probe.c test/libfakecuda.$(SO) cuda_audit.$(SO)
-	$(CC) $(CFLAGS) -o $@ test/probe.c $(PROBE_LIBS) \
-	  -Wl,-rpath,$(CURDIR) -Wl,-rpath,$(CURDIR)/test
+	$(CC) $(CFLAGS) -DLIBSUFFIX='".$(SO)"' -o $@ test/probe.c $(PROBE_LIBS) \
+	  -ldl -Wl,-rpath,$(CURDIR) -Wl,-rpath,$(CURDIR)/test
 
 .PHONY: test
 test: cuda_audit.$(SO) test/probe
 	@echo "interposer test mode: $(MODE)"
 	@rm -f /tmp/mncr-audit-test*
 	@$(RUN_ENV) MNCR_AUDIT_OUT=/tmp/mncr-audit-test ./test/probe > /dev/null
-	@python3 test/assert_audit.py /tmp/mncr-audit-test
+	@python3 test/assert_audit.py /tmp/mncr-audit-test $(EXPECT_ARGS)
 	@rm -f /tmp/mncr-audit-test*
 
 clean:

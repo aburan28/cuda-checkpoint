@@ -25,25 +25,30 @@ from mncr.version import MIN_CRIU, MIN_DRIVER  # noqa: E402
 # api -> (verdict, what to do about it)
 REMEDIATION = {
     "cuMemCreate": (
-        "blocker",
-        "VMM allocation. Usually PyTorch expandable_segments or NCCL's default "
-        "allocator. Free before the lock: destroy_process_group() then "
-        "empty_cache(); disable expandable_segments if the driver rejects held "
-        "segments.",
+        "conditional",
+        "VMM allocation - PyTorch expandable_segments or NCCL's allocator. "
+        "Measured on driver 595: a process merely holding these checkpoints and "
+        "restores cleanly, so expandable_segments does not need disabling. It "
+        "becomes a problem only if the memory is shared and this process is on "
+        "the importing side.",
     ),
     "cuMemMap": (
-        "blocker",
-        "VMM mapping, same origin as cuMemCreate. Same remediation.",
+        "conditional",
+        "VMM mapping, same origin as cuMemCreate. Same reading.",
     ),
     "cuMemExportToShareableHandle": (
-        "blocker",
-        "The documented hard limitation. If handle_type is FABRIC this is MNNVL "
-        "and there is no workaround; if POSIX fd, destroying the owning "
-        "communicator removes it.",
+        "conditional",
+        "Measured on driver 595: the exporting process checkpoints and restores "
+        "fine, even while a peer maps the memory. If handle_type is FABRIC this "
+        "is MNNVL and out of scope regardless.",
     ),
     "cuMemImportFromShareableHandle": (
         "blocker",
-        "Receiving side of an unsupported export. Close before the lock.",
+        "The real one. Measured on driver 595: an importing process checkpoints "
+        "and then FAILS TO RESTORE with \"invalid argument\", past the commit "
+        "point, and cannot be unlocked afterwards. NCCL ranks import each "
+        "other's handles, so communicator teardown before the lock is required, "
+        "not optional.",
     ),
     "cuMemAllocManaged": (
         "blocker",
@@ -59,7 +64,8 @@ REMEDIATION = {
     "cuIpcGetMemHandle": (
         "conditional",
         "Legacy IPC. Supported from driver 610 when the processes were launched "
-        "as one job; verify the job file is in place.",
+        "as one job; verify the job file is in place. Measured on 595: a process "
+        "holding one of these cannot be checkpointed at all.",
     ),
     "cuIpcOpenMemHandle": ("conditional", "Same as cuIpcGetMemHandle."),
 }
@@ -264,6 +270,13 @@ def render(report):
     add("OBSERVED ALLOCATIONS")
     if not report["api_findings"]:
         add("  (no interposer output supplied)")
+        add("")
+        add("  NOTE: an empty result is not the same as a clean workload.")
+        add("  Measured on torch 2.13+cu130: PyTorch's own allocations are not")
+        add("  visible to the interposer, including expandable segments that")
+        add("  demonstrably engaged. For a PyTorch workload, trust the driver's")
+        add("  verdict - checkpoint a canary - over an empty audit.")
+        add("  See docs/findings-595-blackwell.md.")
     for f in report["api_findings"]:
         add(f"  [{f['verdict']:^11}] {f['api']}  x{f['calls']}")
         if f["detail"]:

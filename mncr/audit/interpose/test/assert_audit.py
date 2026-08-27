@@ -22,14 +22,14 @@ EXPECTED_DIRECT = {
 }
 
 
-def main(prefix):
+def main(prefix, expect_dlsym_hook):
     paths = sorted(glob.glob(f"{prefix}*"))
     if not paths:
         print(f"FAIL: the interposer wrote nothing to {prefix}*")
         print("      it was probably not loaded at all")
         return 1
 
-    calls, summary, redirects = [], {}, set()
+    calls, summary, redirects, dlsym_hits = [], {}, set(), set()
     for path in paths:
         with open(path) as fh:
             for line in fh:
@@ -43,6 +43,8 @@ def main(prefix):
                 elif record["event"] == "call":
                     if record["api"] == "cuGetProcAddress":
                         redirects.add(record["detail"])
+                    elif record["api"] == "dlsym":
+                        dlsym_hits.add(record["detail"])
                     else:
                         calls.append(record)
 
@@ -65,11 +67,29 @@ def main(prefix):
 
     # The probe calls cuMemCreate twice: once directly, once through the
     # pointer. Both must land, or the redirect returned the driver's function.
+    # Resolution paths the probe exercises: direct, cuGetProcAddress, and -
+    # where the platform supports interposing it - dlsym on a handle. The last
+    # is glibc-only; macOS builds compile the hook out, so the expectation is
+    # passed in rather than inferred. Inferring it would let a silently broken
+    # hook pass by simply never firing.
+    # With the hook, a fourth: cuMemCreate resolved through a cuGetProcAddress
+    # that was itself obtained by dlsym, which is the path PyTorch takes.
+    expected_creates = 4 if expect_dlsym_hook else 2
     creates = summary.get("cuMemCreate", 0)
-    if creates < 2:
+    if creates < expected_creates:
         problems.append(
-            f"cuMemCreate recorded {creates} time(s), expected 2 - the "
-            f"cuGetProcAddress-resolved call did not go through the wrapper"
+            f"cuMemCreate recorded {creates} time(s), expected {expected_creates} "
+            f"- one of the resolution paths did not go through the wrapper"
+        )
+    if expect_dlsym_hook and "cuMemCreate" not in dlsym_hits:
+        problems.append(
+            "dlsym(cuMemCreate) was not intercepted; a workload that resolves "
+            "driver entry points that way would be invisible to the audit"
+        )
+    if expect_dlsym_hook and "cuGetProcAddress" not in dlsym_hits:
+        problems.append(
+            "dlsym(cuGetProcAddress) handed back the driver's resolver; every "
+            "entry point PyTorch resolves through it would be invisible"
         )
 
     fabric = [
@@ -80,11 +100,24 @@ def main(prefix):
     if not fabric:
         problems.append("the FABRIC handle type was not captured in the detail field")
 
+    # Severities follow what was measured on hardware, not what the vendor
+    # documentation says in the aggregate: holding VMM memory is fine, UVM is
+    # not, and importing somebody else's handle is the one that cannot be
+    # restored. See docs/findings-595-blackwell.md.
     severities = {c["api"]: c["severity"] for c in calls}
-    if severities.get("cuMemCreate") != "blocker":
-        problems.append("cuMemCreate was not classified as a blocker")
-    if severities.get("cuIpcGetMemHandle") != "conditional":
-        problems.append("cuIpcGetMemHandle was not classified as conditional")
+    expected = {
+        "cuMemCreate": "conditional",
+        "cuMemMap": "conditional",
+        "cuMemExportToShareableHandle": "conditional",
+        "cuMemAllocManaged": "blocker",
+        "cuMulticastCreate": "blocker",
+        "cuIpcGetMemHandle": "conditional",
+    }
+    for api, want in expected.items():
+        if api in severities and severities[api] != want:
+            problems.append(
+                f"{api} classified {severities[api]!r}, expected {want!r}"
+            )
 
     if problems:
         print("FAIL")
@@ -96,10 +129,13 @@ def main(prefix):
     print(
         f"interposer ok: {len(calls)} calls, "
         f"{len(redirects)} cuGetProcAddress redirects, "
+        f"{len(dlsym_hits)} dlsym redirects, "
         f"{len(seen)} distinct APIs"
     )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/mncr-audit-test"))
+    prefix = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mncr-audit-test"
+    expect = len(sys.argv) > 2 and sys.argv[2] == "--expect-dlsym-hook"
+    sys.exit(main(prefix, expect))

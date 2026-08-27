@@ -17,6 +17,7 @@ help:
 	@echo "  make interposer  build and test the allocation auditor"
 	@echo ""
 	@echo "on a GPU node"
+	@echo "  ./bootstrap-node.sh --cuda-checkpoint <path>   provision it first"
 	@echo "  make preflight   can this node participate? (real backends)"
 	@echo "  make smoke       driver, criu, agent and a full epoch, for real"
 	@echo "  make p0          fleet audit and allocation report"
